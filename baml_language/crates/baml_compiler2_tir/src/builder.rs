@@ -732,6 +732,15 @@ impl<'db> TypeInferenceBuilder<'db> {
 /// directly lets value-checking call the defaulted algebra methods on the builder
 /// — `self.is_subtype(a, b)` — with no wrapper.
 impl baml_type::normalize::TypeContext for TypeInferenceBuilder<'_> {
+    /// A name-based context represents a declaration by its own name, so this
+    /// is the identity — no resolution step, and never `None`.
+    fn head_lookup(
+        &self,
+        qtn: &baml_type::QualifiedTypeName,
+    ) -> Option<baml_type::QualifiedTypeName> {
+        Some(qtn.clone())
+    }
+
     fn alias_def(&self, name: &crate::ty::QualifiedTypeName) -> Option<Ty> {
         self.as_global().alias_def(name)
     }

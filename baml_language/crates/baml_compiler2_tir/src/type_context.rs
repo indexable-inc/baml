@@ -44,6 +44,12 @@ pub struct GlobalTypeContext<'a, 'db> {
 }
 
 impl baml_type::normalize::TypeContext for GlobalTypeContext<'_, '_> {
+    /// A name-based context represents a declaration by its own name, so this
+    /// is the identity — no resolution step, and never `None`.
+    fn head_lookup(&self, qtn: &QualifiedTypeName) -> Option<QualifiedTypeName> {
+        Some(qtn.clone())
+    }
+
     fn alias_def(&self, name: &QualifiedTypeName) -> Option<Ty> {
         crate::inference::alias_def(self.db, name)
     }
@@ -211,6 +217,12 @@ impl baml_type::normalize::TypeContext for GlobalTypeContext<'_, '_> {
 pub struct AliasEquivCtx<'a>(pub &'a HashMap<QualifiedTypeName, Ty>);
 
 impl baml_type::normalize::TypeContext for AliasEquivCtx<'_> {
+    /// A name-based context represents a declaration by its own name, so this
+    /// is the identity — no resolution step, and never `None`.
+    fn head_lookup(&self, qtn: &QualifiedTypeName) -> Option<QualifiedTypeName> {
+        Some(qtn.clone())
+    }
+
     fn alias_def(&self, name: &QualifiedTypeName) -> Option<Ty> {
         self.0.get(name).cloned()
     }
