@@ -853,7 +853,7 @@ mod tests {
             fields: Vec::new(),
             description: None,
             alias: None,
-            type_tag,
+            type_tag: baml_type::typetag::TypeTag::from_i64(type_tag),
             ty_attr: baml_type::TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,

@@ -49,7 +49,13 @@ use sha2::{Digest, Sha256};
 /// (BEP-062 `reflect.signature`).
 ///
 /// Version 3: diagnostic cache blobs gained `message_highlights` fields.
-pub const FORMAT_VERSION: u32 = 3;
+///
+/// Version 4: `Enum` and `InterfaceDef` gained a borsh-serialized `type_tag`,
+/// so every declaration that can head a nominal type now carries its identity
+/// (previously only `Class` did). `Class::type_tag` changed from `i64` to the
+/// `TypeTag` newtype, which is wire-identical — the bump is for the two added
+/// fields.
+pub const FORMAT_VERSION: u32 = 4;
 
 const MAGIC: [u8; 4] = *b"BEXC";
 

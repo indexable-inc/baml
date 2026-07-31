@@ -1147,7 +1147,9 @@ fn value_type_tag(value: Value) -> i64 {
                     let Object::Class(class) = class_obj else {
                         unreachable!("Instance.class does not point to a Class object")
                     };
-                    class.type_tag
+                    // An instance dispatches on its class's head identity; the
+                    // primitive arms above are raw tags in the same space.
+                    class.type_tag.as_i64()
                 }
             }
         }

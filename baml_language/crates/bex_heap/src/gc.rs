@@ -1438,7 +1438,7 @@ mod tests {
             }],
             description: None,
             alias: None,
-            type_tag: 100,
+            type_tag: baml_type::typetag::TypeTag::from_i64(100),
             ty_attr: baml_type::TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
@@ -2079,7 +2079,7 @@ mod tests {
             fields: vec![],
             description: None,
             alias: None,
-            type_tag: 0,
+            type_tag: baml_type::typetag::TypeTag::from_i64(0),
             ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
@@ -2118,6 +2118,7 @@ mod tests {
         let mut tlab = Tlab::new(Arc::clone(&heap));
 
         let enum_ptr = tlab.alloc(Object::Enum(Box::new(Enum {
+            type_tag: baml_type::typetag::TypeTag::from_i64(200),
             name: TypeName::local(Name::new("Color")),
             variants: vec![],
             description: None,
@@ -2347,7 +2348,7 @@ mod tests {
             fields: vec![],
             description: None,
             alias: None,
-            type_tag: 42,
+            type_tag: baml_type::typetag::TypeTag::from_i64(42),
             ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
@@ -2358,7 +2359,7 @@ mod tests {
             panic!("not class")
         };
         assert_eq!(c.name.name().as_str(), "MyClass");
-        assert_eq!(c.type_tag, 42);
+        assert_eq!(c.type_tag, baml_type::typetag::TypeTag::from_i64(42));
     }
 
     #[test]
@@ -2369,6 +2370,7 @@ mod tests {
         let heap = BexHeap::new(vec![]);
         let mut tlab = Tlab::new(Arc::clone(&heap));
         let ptr = tlab.alloc(Object::Enum(Box::new(Enum {
+            type_tag: baml_type::typetag::TypeTag::from_i64(200),
             name: TypeName::local(Name::new("Status")),
             variants: vec![],
             description: None,
@@ -2794,7 +2796,7 @@ mod tests {
             fields: vec![],
             description: None,
             alias: None,
-            type_tag: 0,
+            type_tag: baml_type::typetag::TypeTag::from_i64(0),
             ty_attr: TyAttr::default(),
             has_cleanup: false,
             generic_param_count: 0,
@@ -2807,6 +2809,7 @@ mod tests {
 
         // --- Container: Object::Variant ---
         let enum_ptr = tlab.alloc(Object::Enum(Box::new(Enum {
+            type_tag: baml_type::typetag::TypeTag::from_i64(200),
             name: TypeName::local(Name::new("E")),
             variants: vec![],
             description: None,
