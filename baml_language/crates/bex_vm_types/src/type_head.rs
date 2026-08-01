@@ -149,11 +149,26 @@ impl std::hash::Hash for TypeHead {
 mod tests {
     use super::*;
 
+    /// Point at `slot`, spanning both shapes of [`HeapPtr::from_ptr`] — the
+    /// `heap_debug` build takes an allocation epoch as well. Kept in one place
+    /// so the tests below read identically under either feature set.
+    fn ptr_to(slot: &mut crate::Object) -> HeapPtr {
+        let raw = std::ptr::from_mut(slot);
+        // SAFETY: every caller's slot outlives the head built from it, so the
+        // pointer stays valid; these tests exercise the relations, never a deref.
+        // The epoch is arbitrary for the same reason — nothing reads through it.
+        #[cfg(not(feature = "heap_debug"))]
+        unsafe {
+            HeapPtr::from_ptr(raw)
+        }
+        #[cfg(feature = "heap_debug")]
+        unsafe {
+            HeapPtr::from_ptr(raw, 0)
+        }
+    }
+
     fn head(slot: &mut crate::Object, tag: i64) -> TypeHead {
-        // SAFETY: `slot` outlives the head in each test below, so the pointer
-        // stays valid; these tests exercise the relations, never a deref.
-        let ptr = unsafe { HeapPtr::from_ptr(std::ptr::from_mut(slot)) };
-        TypeHead::new(ptr, TypeTag::from_i64(tag))
+        TypeHead::new(ptr_to(slot), TypeTag::from_i64(tag))
     }
 
     fn slot() -> crate::Object {
@@ -195,8 +210,10 @@ mod tests {
     /// dereferencing needs the new address.
     #[test]
     fn forwarding_leaves_identity_untouched() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use std::{
+            collections::hash_map::DefaultHasher,
+            hash::{Hash, Hasher},
+        };
 
         let hash_of = |h: &TypeHead| {
             let mut hasher = DefaultHasher::new();
@@ -210,8 +227,7 @@ mod tests {
         let (hash_before, was_less) = (hash_of(&before), before < ordering_peer);
 
         let mut after = before;
-        // SAFETY: `to_space` outlives `after`; no deref occurs.
-        after.forward_to(unsafe { HeapPtr::from_ptr(std::ptr::from_mut(&mut to_space)) });
+        after.forward_to(ptr_to(&mut to_space));
 
         assert_eq!(after, before, "a moved head is still the same head");
         assert_eq!(after.tag(), before.tag());
@@ -258,9 +274,7 @@ mod tests {
         use baml_type::{RealizedTy, TyAttr};
 
         let mut definition = slot();
-        // SAFETY: `definition` outlives every head below; nothing dereferences it.
-        let ptr = unsafe { HeapPtr::from_ptr(std::ptr::from_mut(&mut definition)) };
-        let head = TypeHead::new(ptr, TypeTag::of_head("demo.Person"));
+        let head = TypeHead::new(ptr_to(&mut definition), TypeTag::of_head("demo.Person"));
 
         let ty: RealizedTy<TypeHead> = RealizedTy::List(
             Box::new(RealizedTy::Class(head, vec![], TyAttr::default())),
@@ -277,5 +291,18 @@ mod tests {
         let mut seen_wide = Vec::new();
         widened.visit_heads(&mut |h| seen_wide.push(*h));
         assert_eq!(seen_wide, vec![head]);
+    }
+}
+
+#[cfg(test)]
+mod head_trait {
+    /// `TypeHead` satisfies the algebra's `Head` contract, so `RealizedTy<TypeHead>`
+    /// can be normalized/compared by the same code the compiler uses. Nothing
+    /// implements it explicitly — `Head` is blanket-implemented over its bounds,
+    /// so this asserts the bounds are actually met rather than assumed.
+    #[test]
+    fn type_head_is_a_head() {
+        fn assert_head<H: baml_type::Head>() {}
+        assert_head::<super::TypeHead>();
     }
 }

@@ -1586,7 +1586,7 @@ fn unguarded_mu_disjointness_terminates_conservatively() {
     // The read-back bail keeps the pre-automaton spelling, whose μ spine can be
     // unguarded (`type A = A | A[]`); unfolding it re-injects the μ into its
     // own union spine forever, so the guard must answer first.
-    let unguarded = NormalTy::Mu {
+    let unguarded: NormalTy = NormalTy::Mu {
         binder: MuDisplay {
             name: None,
             rendered: Box::new(Ty::Never {
