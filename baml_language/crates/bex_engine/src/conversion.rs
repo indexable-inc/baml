@@ -368,6 +368,9 @@ impl BexEngine {
             Object::Enum(_) => Err(EngineError::CannotConvert {
                 type_name: "enum".to_string(),
             }),
+            Object::TypeAlias(_) => Err(EngineError::CannotConvert {
+                type_name: "type alias".to_string(),
+            }),
             Object::Future(_) => Err(EngineError::CannotConvert {
                 type_name: "future".to_string(),
             }),
@@ -3043,6 +3046,7 @@ fn find_matching_union_member(value: Value, members: &[RuntimeTy]) -> Option<&Ru
                     }),
                 // Types that don't participate in union discrimination.
                 Object::Function(_)
+                | Object::TypeAlias(_)
                 | Object::Interface(_)
                 | Object::Package(_)
                 | Object::ImplRule(_)
@@ -3163,6 +3167,7 @@ pub(crate) fn vm_arg_to_external(vm: &BexVm, value: Value) -> BexExternalValue {
                 }
                 // These types should not appear as sys op arguments.
                 Object::Function(_)
+                | Object::TypeAlias(_)
                 | Object::Interface(_)
                 | Object::Package(_)
                 | Object::ImplRule(_)

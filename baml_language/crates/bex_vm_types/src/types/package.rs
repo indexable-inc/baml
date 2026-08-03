@@ -1,5 +1,5 @@
 use baml_base::Name;
-use baml_type::{RuntimeTy, TyTemplate};
+use baml_type::TyTemplate;
 use borsh::{BorshDeserialize, BorshSerialize};
 use indexmap::IndexMap;
 
@@ -25,7 +25,10 @@ pub struct Package {
     /// May include implementations for interfaces in the package's dependencies.
     /// key references an `Object::Interface` and each value is an `Object::ImplRule`
     pub impl_rules: IndexMap<HeapPtr, Vec<HeapPtr>>,
-    pub recursive_type_aliases: IndexMap<LocalName, RuntimeTy>,
+    /// Recursive type aliases defined in the package, each an
+    /// `Object::TypeAlias`. Non-recursive aliases are expanded at lowering and
+    /// never reach here.
+    pub type_aliases: IndexMap<LocalName, HeapPtr>,
 }
 
 /// The serialized, global-index-keyed twin of [`Package`]. The `Program` must be
@@ -43,13 +46,13 @@ pub struct ProgramPackage {
     /// Implemented-interface `ObjectIndex` → the impl rules of it declared in
     /// this package (may target an interface from a dependency).
     pub impl_rules: IndexMap<ObjectIndex, Vec<ProgramImplRule>>,
-    pub recursive_type_aliases: IndexMap<LocalName, RuntimeTy>,
+    pub type_aliases: IndexMap<LocalName, ObjectIndex>,
 }
 
 impl ProgramPackage {
     /// Sort every per-kind map and each impl-rule list into the content-determined
     /// order the serialized `Program` requires, so the bytes are reproducible
-    /// regardless of the source maps' iteration order (`recursive_type_aliases` in
+    /// regardless of the source maps' iteration order (`type_aliases` in
     /// particular is sourced from a per-process-seeded `std::HashMap`).
     ///
     /// Impl rules key on their rendered `for_ty_pattern`; that `Display` drops
@@ -63,7 +66,7 @@ impl ProgramPackage {
     pub fn sort_maps(&mut self) {
         self.classes.sort_keys();
         self.enums.sort_keys();
-        self.recursive_type_aliases.sort_keys();
+        self.type_aliases.sort_keys();
         self.interfaces.sort_keys();
         self.impl_rules.sort_keys();
         for rules in self.impl_rules.values_mut() {
