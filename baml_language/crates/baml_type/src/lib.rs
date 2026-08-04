@@ -361,18 +361,6 @@ impl Ty {
         }
     }
 
-    /// True if this is exactly the `null` type.
-    pub fn is_null(&self) -> bool {
-        matches!(self, Ty::Null { .. })
-    }
-
-    /// True if this is a union that includes `null` — i.e. an optional type
-    /// after `?` lowering. This is the canonical "is this nullable" predicate;
-    /// it replaces matching on the old `Ty::Optional` variant.
-    pub fn is_nullable_union(&self) -> bool {
-        matches!(self, Ty::Union(members, _) if members.iter().any(Ty::is_null))
-    }
-
     /// Remove `null` from a nullable union, collapsing the result: `T | null`
     /// → `T`, `A | B | null` → `A | B`, a non-nullable type → unchanged. The
     /// inverse direction of [`Ty::optional`]; used where the non-null payload
@@ -620,6 +608,18 @@ impl Ty {
 }
 
 impl<N: Clone> Ty<N> {
+    /// True if this is exactly the `null` type.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Ty::Null { .. })
+    }
+
+    /// True if this is a union that includes `null` — i.e. an optional type
+    /// after `?` lowering. This is the canonical "is this nullable" predicate;
+    /// it replaces matching on the old `Ty::Optional` variant.
+    pub fn is_nullable_union(&self) -> bool {
+        matches!(self, Ty::Union(members, _) if members.iter().any(Ty::is_null))
+    }
+
     fn needs_postfix_parens(&self) -> bool {
         matches!(self, Ty::Union(..) | Ty::Function { .. })
     }
@@ -669,6 +669,27 @@ pub trait HeadDisplay {
 impl HeadDisplay for QualifiedTypeName {
     fn head_display_name(&self) -> String {
         self.display_name().to_string()
+    }
+}
+
+/// A head representation that can be *minted* from a qualified name.
+///
+/// The counterpart to [`HeadDisplay`], and the reason a fact-free context can
+/// still answer [`TypeContext::head_lookup`](normalize::TypeContext::head_lookup)
+/// at any head: naming a declaration is not a fact *about* it, so no registry or
+/// heap is needed. A compiler head is the name; a runtime head is derived from
+/// it, since a declared head's tag is content-addressed.
+///
+/// Deliberately separate from [`Head`], which the algebra keeps opaque — this is
+/// opt-in for representations that happen to support it.
+pub trait HeadFromName {
+    /// The head `qtn` denotes.
+    fn head_from_name(qtn: &QualifiedTypeName) -> Self;
+}
+
+impl HeadFromName for QualifiedTypeName {
+    fn head_from_name(qtn: &QualifiedTypeName) -> Self {
+        qtn.clone()
     }
 }
 

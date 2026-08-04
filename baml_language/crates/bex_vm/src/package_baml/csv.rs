@@ -1310,11 +1310,10 @@ enum Target {
     Bigint,
     Float,
     Bool,
-    // Keep the enum's `TypeName` (not its rendered string) so it can be resolved
-    // through `vm.lookup_type`, which handles user-package enums; the rendered
-    // `class_key` elides the `user.` prefix and is not a valid `lookup_type_by_fqn`
-    // key.
-    Enum(baml_type::TypeName),
+    // Keep the enum's head rather than a rendered string: the head *is* the
+    // identity (an integer tag) and reaches the declaration by dereference, so
+    // no lookup and no name-mangling round trip is involved.
+    Enum(bex_vm_types::TypeHead),
     Instant,
     PlainDate,
     PlainDateTime,
@@ -1325,12 +1324,22 @@ struct CellTy {
     nullable: bool,
 }
 
-fn class_key(qtn: &baml_type::TypeName) -> String {
-    qtn.render_dotted(false)
+/// A head's name, for error messages only. Identity comparisons use
+/// [`head_is`] — an integer compare — never this.
+fn class_key(head: &bex_vm_types::TypeHead) -> String {
+    baml_type::HeadDisplay::head_display_name(head)
 }
 
-fn classify_cell_ty(ty: &baml_type::RealizedTy) -> Result<CellTy, String> {
-    use baml_type::RealizedTy;
+/// Whether `head` is the declaration with fully-qualified name `fqn`.
+///
+/// Tags are content-addressed from the name, so this is an integer compare
+/// against a value the optimizer can fold — not a string render plus `==`.
+fn head_is(head: &bex_vm_types::TypeHead, fqn: &str) -> bool {
+    head.tag() == baml_type::typetag::TypeTag::of_head(fqn)
+}
+
+fn classify_cell_ty(ty: &bex_vm_types::RealizedTy) -> Result<CellTy, String> {
+    use bex_vm_types::RealizedTy;
     let nullable = ty.is_nullable_union();
     let base = if nullable {
         ty.strip_null()
@@ -1343,12 +1352,10 @@ fn classify_cell_ty(ty: &baml_type::RealizedTy) -> Result<CellTy, String> {
         RealizedTy::Bigint { .. } => Target::Bigint,
         RealizedTy::Float { .. } => Target::Float,
         RealizedTy::Bool { .. } => Target::Bool,
-        RealizedTy::Enum(qtn, _) => Target::Enum(qtn.clone()),
-        RealizedTy::Class(qtn, _, _) if class_key(qtn) == INSTANT_FQN => Target::Instant,
-        RealizedTy::Class(qtn, _, _) if class_key(qtn) == PLAINDATE_FQN => Target::PlainDate,
-        RealizedTy::Class(qtn, _, _) if class_key(qtn) == PLAINDATETIME_FQN => {
-            Target::PlainDateTime
-        }
+        RealizedTy::Enum(qtn, _) => Target::Enum(*qtn),
+        RealizedTy::Class(qtn, _, _) if head_is(qtn, INSTANT_FQN) => Target::Instant,
+        RealizedTy::Class(qtn, _, _) if head_is(qtn, PLAINDATE_FQN) => Target::PlainDate,
+        RealizedTy::Class(qtn, _, _) if head_is(qtn, PLAINDATETIME_FQN) => Target::PlainDateTime,
         other => return Err(format!("type `{other}` is not cell-decodable")),
     };
     Ok(CellTy { target, nullable })
@@ -1409,7 +1416,7 @@ fn convert_cell(vm: &mut BexVm, text: &str, target: &Target) -> Result<Conv, VmR
             }
         }
         Target::Enum(qtn) => {
-            let Some(enm_ptr) = vm.lookup_type(qtn) else {
+            let Some(enm_ptr) = vm.declaration(*qtn) else {
                 return Ok(Conv::Bad(format!("enum `{}` not found", class_key(qtn))));
             };
             let idx = match vm.get_object(enm_ptr) {
@@ -1503,9 +1510,9 @@ fn record_arc(vm: &BexVm, rec: Value) -> Result<Arc<RecordData>, VmRustFnError> 
 fn decode_record_to_instance(
     vm: &mut BexVm,
     rd: &RecordData,
-    ty: &baml_type::RealizedTy,
+    ty: &bex_vm_types::RealizedTy,
 ) -> Result<Value, DecodeFail> {
-    use baml_type::RealizedTy;
+    use bex_vm_types::RealizedTy;
     let RealizedTy::Class(qtn, type_args, _) = ty else {
         return Err(DecodeFail::Info(ErrInfo::new(
             Kind::Options,
@@ -1513,7 +1520,7 @@ fn decode_record_to_instance(
         )));
     };
     let key = class_key(qtn);
-    let Some(class_ptr) = vm.lookup_type(qtn) else {
+    let Some(class_ptr) = vm.declaration(*qtn) else {
         return Err(DecodeFail::Info(ErrInfo::new(
             Kind::Options,
             format!("class `{key}` not found"),
@@ -1642,7 +1649,7 @@ fn decode_record_to_instance(
     ))))
 }
 
-fn current_type_arg(vm: &mut BexVm, who: &str) -> Result<baml_type::RealizedTy, VmRustFnError> {
+fn current_type_arg(vm: &mut BexVm, who: &str) -> Result<bex_vm_types::RealizedTy, VmRustFnError> {
     // `.first()` is the method's own first generic only because `CsvRecord` is
     // non-generic, so MIR's receiver-class-type-arg prepend (which would push
     // class args ahead of the method's) contributes nothing here. A generic
@@ -1660,7 +1667,7 @@ fn cell_to_optional(
     vm: &mut BexVm,
     rd: &RecordData,
     col: Option<usize>,
-    ty: &baml_type::RealizedTy,
+    ty: &bex_vm_types::RealizedTy,
 ) -> Result<Option<Value>, VmRustFnError> {
     let cell_ty = match classify_cell_ty(ty) {
         Ok(c) => c,
@@ -1932,7 +1939,9 @@ fn value_cell_text(vm: &BexVm, v: Value, null_value: &str) -> Result<String, Cel
                 // builtin date/time classes, rather than re-resolving each
                 // candidate FQN through the package index per cell.
                 let class_fqn = match vm.get_object(inst.class) {
-                    Object::Class(class) => class_key(&class.name),
+                    // The instance points straight at its declaration, so its
+                    // own `TypeName` is in hand — no head to name here.
+                    Object::Class(class) => class.name.render_dotted(false),
                     _ => {
                         return Err(CellTextErr::Unsupported(
                             "value is not representable as a CSV cell".to_string(),
@@ -2032,7 +2041,7 @@ fn md_escape(text: &str) -> String {
     out
 }
 
-fn md_value_text(vm: &mut BexVm, v: Value, field_ty: Option<&baml_type::RealizedTy>) -> String {
+fn md_value_text(vm: &mut BexVm, v: Value, field_ty: Option<&bex_vm_types::RealizedTy>) -> String {
     // Prompt text is not meant to round-trip: non-finite floats render as-is.
     if let ValueKind::Object(ptr) = v.kind() {
         if let Object::Float(f) = vm.get_object(ptr) {
@@ -2167,7 +2176,7 @@ impl BamlClassCsvCsvReader for PackageBamlImpl {
                             .map(|n| Value::object(vm.alloc_string(n)))
                             .collect();
                         // CSV header names are always strings.
-                        Value::object(vm.alloc_array(baml_type::RealizedTy::string(), items))
+                        Value::object(vm.alloc_array(bex_vm_types::RealizedTy::string(), items))
                     }
                 };
                 Ok(copy::csv::CsvHeaders { names: names_value }.to_value(vm))
@@ -2423,7 +2432,7 @@ impl BamlNamespaceCsv for PackageBamlImpl {
     }
 
     fn _validate_columns(vm: &mut BexVm, r: &Value) -> Result<(), VmRustFnError> {
-        use baml_type::RealizedTy;
+        use bex_vm_types::RealizedTy;
         let ty = current_type_arg(vm, "baml.csv.rows")?;
         let RealizedTy::Class(qtn, type_args, _) = &ty else {
             let info = ErrInfo::new(
@@ -2433,11 +2442,10 @@ impl BamlNamespaceCsv for PackageBamlImpl {
             return Err(throw_err(vm, &info));
         };
         let key = class_key(qtn);
-        let class_ptr = vm.lookup_type(qtn).ok_or_else(|| {
-            VmRustFnError::InternalError(VmInternalError::MissingNativeFunction {
-                name: format!("class `{key}` not found"),
-            })
-        })?;
+        let Some(class_ptr) = vm.declaration(*qtn) else {
+            let info = ErrInfo::new(Kind::Options, format!("class `{key}` not found"));
+            return Err(throw_err(vm, &info));
+        };
         let class_fields = match vm.get_object(class_ptr) {
             Object::Class(c) => c.fields.clone(),
             _ => {
@@ -2624,14 +2632,14 @@ impl BamlNamespaceCsv for PackageBamlImpl {
     }
 
     fn _to_markdown(vm: &mut BexVm, rows: &[Value], max_rows: i64) -> bex_str::BexStr {
-        use baml_type::RealizedTy;
+        use bex_vm_types::RealizedTy;
         let ty = vm.current_call_type_args().first().cloned();
         let max = usize::try_from(max_rows).unwrap_or(0);
 
         // Header names + field types from T (or the first row's class).
         let class_info = match &ty {
             Some(RealizedTy::Class(qtn, type_args, _)) => {
-                vm.lookup_type(qtn)
+                vm.declaration(*qtn)
                     .and_then(|ptr| match vm.get_object(ptr) {
                         Object::Class(c) => Some(
                             c.fields

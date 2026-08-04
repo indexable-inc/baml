@@ -15,8 +15,8 @@
 //! per argument via [`class_type_arg_matches`] — invariantly, since BAML
 //! generics are invariant.
 
-use baml_type::{RealizedTy, Ty, TyTemplate, normalize};
-use bex_vm_types::{Value, errors::VmInternalError};
+use baml_type::normalize;
+use bex_vm_types::{RealizedTy, TyTemplate, Value, errors::VmInternalError};
 
 use crate::BexVm;
 
@@ -50,7 +50,7 @@ pub(crate) fn value_matches_template(
     // The canonical algebra operates over `Ty`; a value's concrete type widens
     // into it (a shallow structural conversion — `ConcreteRealizedTy` is not a
     // deep, transmute-compatible family member with a borrowed upcast).
-    let value_ty: Ty = value_ty.into();
+    let value_ty: baml_type::Ty<bex_vm_types::TypeHead> = value_ty.into();
     // Resolve frame references into a realized type, then let the canonical
     // algebra do the work.
     let expected = template.substitute(frame_type_args, vm).map_err(|e| {
@@ -66,11 +66,11 @@ pub(crate) fn value_matches_template(
 /// `ClassWithTypeArgs` check. BAML generics are invariant, so the relation is
 /// canonical equivalence, not membership. A substitution failure is a broken
 /// invariant, exactly as in [`value_matches_template`].
-pub(crate) fn class_type_arg_matches<C: normalize::TypeContext>(
+pub(crate) fn class_type_arg_matches<C: normalize::TypeContext<bex_vm_types::TypeHead>>(
     ctx: &C,
     template: &TyTemplate,
     frame_type_args: &[RealizedTy],
-    actual: &Ty,
+    actual: &baml_type::Ty<bex_vm_types::TypeHead>,
 ) -> Result<bool, VmInternalError> {
     let expected = template.substitute(frame_type_args, ctx).map_err(|e| {
         VmInternalError::TypeSubstitution {
@@ -82,10 +82,10 @@ pub(crate) fn class_type_arg_matches<C: normalize::TypeContext>(
 
 #[cfg(test)]
 mod tests {
-    use baml_type::{
-        Interface, Name, ParamTy, QualifiedTypeName, RealizedTy, RuntimeTy, TyTemplate, TypeName,
-        normalize::TypeContext,
-    };
+    // The matcher runs at the runtime head, so the tests build their operands
+    // there too; `TypeHead::of_name` gives a comparable head with no heap.
+    use baml_type::{Interface, Name, ParamTy, QualifiedTypeName, Ty, TypeName, normalize};
+    use bex_vm_types::{RealizedTy, RuntimeTy, TyTemplate, TypeHead};
 
     use super::class_type_arg_matches;
 
@@ -95,44 +95,58 @@ mod tests {
     /// that don't need program facts. Nominal facts (a class implementing an
     /// interface) are validated by the VM-backed e2e tests.
     struct EmptyCtx;
-    impl TypeContext for EmptyCtx {
-        /// A name-based context represents a declaration by its own name, so this
-        /// is the identity — no resolution step, and never `None`.
-        fn head_lookup(
-            &self,
-            qtn: &baml_type::QualifiedTypeName,
-        ) -> Option<baml_type::QualifiedTypeName> {
-            Some(qtn.clone())
+    impl normalize::TypeContext<TypeHead> for EmptyCtx {
+        /// Heads are content-addressed from names, so even a fact-free context
+        /// can answer this — and must, or the `AnyFunction` covariance rule
+        /// silently stops firing.
+        fn head_lookup(&self, qtn: &QualifiedTypeName) -> Option<TypeHead> {
+            Some(TypeHead::of_name(qtn))
         }
 
-        fn alias_def(&self, _: &QualifiedTypeName) -> Option<baml_type::Ty> {
+        fn alias_def(&self, _name: &TypeHead) -> Option<Ty<TypeHead>> {
             None
         }
-        fn implements_interface(&self, _: &baml_type::Ty, _: &Interface) -> bool {
+
+        fn implements_interface(
+            &self,
+            _concrete: &Ty<TypeHead>,
+            _interface: &Interface<TypeHead>,
+        ) -> bool {
             false
         }
-        fn type_var_bound(&self, _: &ParamTy) -> Vec<Interface> {
+
+        fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface<TypeHead>> {
             Vec::new()
         }
-        fn interface_requires(&self, _: &Interface, _: &Interface) -> bool {
+
+        fn interface_requires(
+            &self,
+            _sub: &Interface<TypeHead>,
+            _sup: &Interface<TypeHead>,
+        ) -> bool {
             false
         }
-        fn enum_variants(&self, _: &QualifiedTypeName) -> Option<Vec<Name>> {
+
+        fn enum_variants(&self, _name: &TypeHead) -> Option<Vec<Name>> {
             None
         }
-        fn associated_type_bound(&self, _: &Interface, _: Name) -> Vec<Interface> {
-            // Context-free: no interface declarations, so no declared bounds.
+
+        fn associated_type_bound(
+            &self,
+            _interface: &Interface<TypeHead>,
+            _assoc: Name,
+        ) -> Vec<Interface<TypeHead>> {
             Vec::new()
         }
+
         fn project(
             &self,
-            _: &baml_type::Ty,
-            _: &Interface,
-            _: &Name,
+            _base: &Ty<TypeHead>,
+            _interface: &Interface<TypeHead>,
+            _member: &Name,
             _fuel: u32,
-        ) -> baml_type::normalize::ProjectionStep {
-            // Context-free: no impls to reduce through; projections stay opaque.
-            baml_type::normalize::ProjectionStep::Opaque
+        ) -> normalize::ProjectionStep<TypeHead> {
+            normalize::ProjectionStep::Opaque
         }
     }
 
@@ -168,8 +182,10 @@ mod tests {
         TyTemplate::from(ty)
     }
 
-    fn user_class(name: &str) -> TypeName {
-        TypeName::local(Name::new(name))
+    /// A head for a user class. Unresolved — these tests compare, and identity
+    /// is the tag.
+    fn user_class(name: &str) -> bex_vm_types::TypeHead {
+        bex_vm_types::TypeHead::of_name(&TypeName::local(Name::new(name)))
     }
 
     #[test]
@@ -208,16 +224,16 @@ mod tests {
     #[test]
     fn class_type_args_are_invariant() {
         let tn = user_class("Foo");
-        let foo_int = TyTemplate::class(tn.clone(), vec![leaf(RealizedTy::int())]);
+        let foo_int = TyTemplate::class(tn, vec![leaf(RealizedTy::int())]);
         assert!(matches(
             &foo_int,
             &[],
-            &RuntimeTy::class_with_args(tn.clone(), vec![RuntimeTy::int()])
+            &RuntimeTy::Class(tn, vec![RuntimeTy::int()], baml_type::TyAttr::default())
         ));
         assert!(!matches(
             &foo_int,
             &[],
-            &RuntimeTy::class_with_args(tn, vec![RuntimeTy::string()])
+            &RuntimeTy::Class(tn, vec![RuntimeTy::string()], baml_type::TyAttr::default())
         ));
     }
 

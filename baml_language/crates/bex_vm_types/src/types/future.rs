@@ -8,11 +8,10 @@ use std::{
     },
 };
 
-use baml_type::RealizedTy;
 use borsh::{BorshDeserialize, BorshSerialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::{HeapPtr, Value, errors::StackFrame};
+use crate::{HeapPtr, RealizedTy, Value, errors::StackFrame};
 
 /// Error payload carried by a future's [`Future::ready`] `SetOnce` when the
 /// underlying engine produced an unrecoverable internal error.

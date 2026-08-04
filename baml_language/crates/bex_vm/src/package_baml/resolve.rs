@@ -8,16 +8,15 @@
 //! impl applies (the caller decides the fallback).
 //!
 //! This mirrors the compiler's selection (`match_ty_pattern` + bound validation
-//! in `baml_compiler2_tir::interfaces`), run on `baml_type::RealizedTy`: unify the rule's
+//! in `baml_compiler2_tir::interfaces`), run on `bex_vm_types::RealizedTy`: unify the rule's
 //! `for_ty_pattern` against the concrete type (binding the impl's generic
 //! params), then discharge each param's declared bound as a nested obligation.
 
 use std::borrow::Cow;
 
-use baml_type::{
-    Literal, MediaKind, Name, RealizedTy, TyAttr, TyTemplate, TypeName, normalize::TypeContext,
-};
+use baml_type::{Literal, MediaKind, Name, TyAttr, normalize::TypeContext};
 use bex_vm_types::{
+    RealizedTy, TyTemplate,
     errors::VmInternalError,
     types::{Object, RuntimeImplRule},
 };
@@ -47,9 +46,16 @@ impl<'vm> ImplResolver<'vm> {
     /// one O(1) lookup over a table that already spans every package — see that
     /// type's docs for why a per-package search cannot be narrowed correctly. An
     /// unknown interface (not loaded) has no impls anywhere.
-    fn rules_for(self, iface: &TypeName) -> impl Iterator<Item = &'vm RuntimeImplRule> {
-        let iface_ptr = self.vm.lookup_interface(iface);
-        iface_ptr
+    fn rules_for(
+        self,
+        iface: &bex_vm_types::TypeHead,
+    ) -> impl Iterator<Item = &'vm RuntimeImplRule> {
+        // The head reaches the declaration directly when it was read out of a
+        // loaded object; a head minted from a name (an operator interface, say)
+        // is unresolved and resolves through the load-time tag index.
+        self.vm
+            .packages
+            .declaration_of(*iface)
             .into_iter()
             .flat_map(move |ptr| self.vm.packages.impl_rules_of(ptr))
             .filter_map(move |&rule_ptr| self.vm.get_object(rule_ptr).as_impl_rule())
@@ -72,7 +78,7 @@ const MAX_OBLIGATION_DEPTH: usize = 128;
 /// is detected and rejected rather than spun on until the depth backstop.
 type Obligation = (
     RealizedTy,
-    TypeName,
+    bex_vm_types::TypeHead,
     Vec<RealizedTy>,
     Vec<(Name, RealizedTy)>,
 );
@@ -96,9 +102,7 @@ fn concrete_base(ty: &RealizedTy) -> Cow<'_, RealizedTy> {
             Literal::String(_) => RealizedTy::String { attr: attr.clone() },
             Literal::Bool(_) => RealizedTy::Bool { attr: attr.clone() },
         }),
-        RealizedTy::EnumVariant(name, _, attr) => {
-            Cow::Owned(RealizedTy::Enum(name.clone(), attr.clone()))
-        }
+        RealizedTy::EnumVariant(name, _, attr) => Cow::Owned(RealizedTy::Enum(*name, attr.clone())),
         _ => Cow::Borrowed(ty),
     }
 }
@@ -132,7 +136,7 @@ impl<'vm> ImplResolver<'vm> {
     pub(crate) fn resolve_implements_rule(
         self,
         concrete_ty: &RealizedTy,
-        iface: &TypeName,
+        iface: &bex_vm_types::TypeHead,
         iface_args: &[RealizedTy],
     ) -> Option<(&'vm RuntimeImplRule, Vec<RealizedTy>)> {
         for rule in self.rules_for(iface) {
@@ -187,7 +191,7 @@ impl<'vm> ImplResolver<'vm> {
     pub(crate) fn type_implements(
         self,
         concrete_ty: &RealizedTy,
-        iface: &TypeName,
+        iface: &bex_vm_types::TypeHead,
         requested_args: &[RealizedTy],
         requested_assoc: &[(Name, RealizedTy)],
     ) -> bool {
@@ -208,7 +212,7 @@ impl<'vm> ImplResolver<'vm> {
     fn prove(
         self,
         concrete_ty: &RealizedTy,
-        iface: &TypeName,
+        iface: &bex_vm_types::TypeHead,
         requested_args: &[RealizedTy],
         requested_assoc: &[(Name, RealizedTy)],
         stack: &mut Vec<Obligation>,
@@ -217,7 +221,7 @@ impl<'vm> ImplResolver<'vm> {
         // are the same goal for cycle purposes.
         let goal: Obligation = (
             concrete_base(concrete_ty).into_owned(),
-            iface.clone(),
+            *iface,
             requested_args.to_vec(),
             requested_assoc.to_vec(),
         );
@@ -317,7 +321,7 @@ impl<'vm> ImplResolver<'vm> {
     fn interface_existential_satisfies_bound(
         self,
         concrete_ty: &RealizedTy,
-        iface: &TypeName,
+        iface: &bex_vm_types::TypeHead,
         requested_args: &[RealizedTy],
         requested_assoc: &[(Name, RealizedTy)],
     ) -> bool {
@@ -591,7 +595,10 @@ impl ImplResolver<'_> {
     /// any"); a blanket `for T` contributes every loaded concrete class whose
     /// bounds it satisfies. Container/union for-types have no nominal implementor
     /// to list.
-    pub(super) fn implementor_entries(self, iface: &TypeName) -> Vec<ImplementorEntry> {
+    pub(super) fn implementor_entries(
+        self,
+        iface: &bex_vm_types::TypeHead,
+    ) -> Vec<ImplementorEntry> {
         let mut out: Vec<ImplementorEntry> = Vec::new();
         // `rules_for` borrows the VM for the iteration; the blanket arm below
         // re-enters it via `concrete_types`, so collect the candidates first.
@@ -620,7 +627,7 @@ impl ImplResolver<'_> {
                 // A generic class for-type (`Foo<T>`) is reported by its base.
                 TyTemplate::Class(name, _, _) => {
                     let (args, assoc) = self.pinned_interface_instantiation(rule);
-                    let base = RealizedTy::Class(name.clone(), Vec::new(), TyAttr::default());
+                    let base = RealizedTy::Class(*name, Vec::new(), TyAttr::default());
                     push_unique(&mut out, (base, args, assoc));
                 }
                 _ => {}
@@ -731,14 +738,17 @@ impl ImplResolver<'_> {
             .vm
             .all_class_and_enum_ptrs()
             .filter_map(|ptr| match self.vm.get_object(ptr) {
+                // The declaration is right here, so its head is the pointer we
+                // already hold paired with the tag it carries.
                 Object::Class(class) => Some(RealizedTy::Class(
-                    class.name.clone(),
+                    bex_vm_types::TypeHead::new(ptr, class.type_tag),
                     Vec::new(),
                     TyAttr::default(),
                 )),
-                Object::Enum(enum_def) => {
-                    Some(RealizedTy::Enum(enum_def.name.clone(), TyAttr::default()))
-                }
+                Object::Enum(enum_def) => Some(RealizedTy::Enum(
+                    bex_vm_types::TypeHead::new(ptr, enum_def.type_tag),
+                    TyAttr::default(),
+                )),
                 _ => None,
             })
             .collect();
@@ -809,7 +819,9 @@ fn push_unique(out: &mut Vec<ImplementorEntry>, entry: ImplementorEntry) {
 /// Whether `ty` is an internal `…$stream` companion type.
 fn is_stream_companion(ty: &RealizedTy) -> bool {
     match ty {
-        RealizedTy::Class(tn, ..) | RealizedTy::Enum(tn, ..) => tn.name().ends_with("$stream"),
+        RealizedTy::Class(tn, ..) | RealizedTy::Enum(tn, ..) => {
+            tn.display_name().ends_with("$stream")
+        }
         _ => false,
     }
 }

@@ -62,6 +62,44 @@ fn build_alias_caches(
     caches
 }
 
+// ── Anchoring compiled types onto runtime heads ──────────────────────────────
+//
+// Runtime declarations reference other types by [`bex_vm_types::TypeHead`], not
+// by name. Emit is the one place that conversion belongs: a declared head's tag
+// is content-addressed from its fully-qualified name, so anchoring is pure and
+// needs no heap — and the heads it produces are *unresolved*, for the loader to
+// bind. That is why these are private to emit rather than offered by
+// `bex_vm_types`: they are only correct while building compile-time data.
+
+/// Anchor a signature template's heads.
+pub(crate) fn anchor_template(ty: &baml_type::TyTemplate) -> bex_vm_types::TyTemplate {
+    ty.map_heads(&mut bex_vm_types::TypeHead::of_name)
+}
+
+/// Anchor each template in a slice.
+pub(crate) fn anchor_templates(tys: &[baml_type::TyTemplate]) -> Vec<bex_vm_types::TyTemplate> {
+    tys.iter().map(anchor_template).collect()
+}
+
+/// Anchor each named template binding.
+fn anchor_named_templates(
+    tys: &[(baml_type::Name, baml_type::TyTemplate)],
+) -> Vec<(baml_type::Name, bex_vm_types::TyTemplate)> {
+    tys.iter()
+        .map(|(n, t)| (n.clone(), anchor_template(t)))
+        .collect()
+}
+
+/// Anchor a declaration-facing type's heads.
+fn anchor_runtime(ty: &baml_type::RuntimeTy) -> bex_vm_types::RuntimeTy {
+    ty.map_heads(&mut bex_vm_types::TypeHead::of_name)
+}
+
+/// Anchor a realized type's heads.
+fn anchor_realized(ty: &baml_type::RealizedTy) -> bex_vm_types::RealizedTy {
+    ty.map_heads(&mut bex_vm_types::TypeHead::of_name)
+}
+
 /// Build the runtime [`InterfaceDef`](bex_vm_types::types::InterfaceDef) signature
 /// — generic-param bounds, `requires`, associated-type bounds, fields, and method
 /// signatures — for one interface, from its item-tree declaration.
@@ -87,7 +125,6 @@ fn build_interface_def(
         lower_type_expr::{ScopeCtx, TypeVarBoundsMap, lower_type_ref},
         ty,
     };
-    use baml_type::RuntimeInterface;
     use bex_vm_types::types::{InterfaceDef, InterfaceFieldDef, InterfaceMethodDef};
 
     let file = iface_loc.file(db);
@@ -135,7 +172,7 @@ fn build_interface_def(
                     id: TypeRefId,
                     scope: &[ParamTy],
                     bounds: &TypeVarBoundsMap|
-     -> RuntimeTy {
+     -> bex_vm_types::RuntimeTy {
         let mut diags = Vec::new();
         let ty = lower_type_ref(
             store,
@@ -150,9 +187,13 @@ fn build_interface_def(
             },
             &mut diags,
         );
-        baml_type::lower_to_runtime(&ty, resolved).unwrap_or_else(|e| {
+        let named = baml_type::lower_to_runtime(&ty, resolved).unwrap_or_else(|e| {
             unreachable!("interface `{iface_tn}` declares a non-runtime type: {e:?}")
-        })
+        });
+        // Runtime declarations carry heads, not names. Anchoring here is pure —
+        // a declared head's tag is content-addressed — and leaves each head
+        // unresolved for the loader to bind.
+        named.map_heads(&mut bex_vm_types::TypeHead::of_name)
     };
     // Lower an interface bound / `requires` target / associated-type bound. These are
     // constraint heads, not existentials: they pin only the members they write. A
@@ -162,7 +203,7 @@ fn build_interface_def(
                        id: TypeRefId,
                        scope: &[ParamTy],
                        bounds: &TypeVarBoundsMap|
-     -> Option<RuntimeInterface> {
+     -> Option<bex_vm_types::RuntimeInterface> {
         let mut diags = Vec::new();
         let ty::Ty::Interface(qtn, args, assoc, _) =
             baml_compiler2_tir::lower_type_expr::lower_constraint_head_type_ref(
@@ -182,16 +223,22 @@ fn build_interface_def(
             return None;
         };
         let to_runtime = |t: &ty::Ty| {
-            baml_type::lower_to_runtime(t, resolved).unwrap_or_else(|e| {
-                unreachable!("interface `{iface_tn}` declares a non-runtime constraint: {e:?}")
-            })
+            baml_type::lower_to_runtime(t, resolved)
+                .unwrap_or_else(|e| {
+                    unreachable!("interface `{iface_tn}` declares a non-runtime constraint: {e:?}")
+                })
+                .map_heads(&mut bex_vm_types::TypeHead::of_name)
         };
         let generics = args.iter().map(&to_runtime).collect();
         let associated_types = assoc
             .iter()
             .map(|(n, t)| (n.clone(), to_runtime(t)))
             .collect();
-        Some(RuntimeInterface::new(qtn, generics, associated_types))
+        Some(bex_vm_types::RuntimeInterface::new(
+            bex_vm_types::TypeHead::of_name(&qtn),
+            generics,
+            associated_types,
+        ))
     };
     // A method's runtime signature: Required params → positional `args`, optional
     // (defaulted) params → `kwargs`; the `self` receiver is dropped; absent
@@ -206,10 +253,10 @@ fn build_interface_def(
      -> InterfaceMethodDef {
         // An untyped parameter is a syntax-level error, so it cannot reach emit; the
         // top type keeps the positional layout intact if one ever did.
-        let unannotated = || RuntimeTy::BuiltinUnknown {
+        let unannotated = || bex_vm_types::RuntimeTy::BuiltinUnknown {
             attr: TyAttr::default(),
         };
-        let void = || RuntimeTy::Void {
+        let void = || bex_vm_types::RuntimeTy::Void {
             attr: TyAttr::default(),
         };
         let mut args = Vec::new();
@@ -593,7 +640,7 @@ fn build_packages(
                     .entry(name.clone())
                     .or_insert_with(|| ProgramMethodImpl {
                         fqn: fqn_idx,
-                        frame: interface_frame.to_vec(),
+                        frame: anchor_templates(interface_frame),
                     });
             }
         }
@@ -677,9 +724,9 @@ fn build_packages(
                             let bound_ty = lower_constraint_head(store, id, generics, bounds);
                             split_interface(&bound_ty, resolved, generics).map(
                                 |(interface, args, assoc)| InterfaceBound {
-                                    interface,
-                                    args,
-                                    assoc,
+                                    interface: bex_vm_types::TypeHead::of_name(&interface),
+                                    args: anchor_templates(&args),
+                                    assoc: anchor_named_templates(&assoc),
                                 },
                             )
                         })
@@ -785,7 +832,7 @@ fn build_packages(
                     function_data(db, m).name.clone(),
                     ProgramMethodImpl {
                         fqn,
-                        frame: impl_frame.clone(),
+                        frame: anchor_templates(&impl_frame),
                     },
                 );
             }
@@ -804,10 +851,10 @@ fn build_packages(
                 .or_default()
                 .push(ProgramImplRule {
                     interface_head,
-                    for_ty_pattern,
+                    for_ty_pattern: anchor_template(&for_ty_pattern),
                     generic_param_bounds,
-                    interface_args,
-                    interface_assoc,
+                    interface_args: anchor_templates(&interface_args),
+                    interface_assoc: anchor_named_templates(&interface_assoc),
                     methods,
                     // An out-of-body impl of a field-bearing interface is E0126, so a
                     // rule built here never has fields to link — its `for` target need
@@ -962,7 +1009,7 @@ fn build_packages(
                             name.clone(),
                             ProgramMethodImpl {
                                 fqn: resolve_fqn(fqn)?,
-                                frame: impl_frame.clone(),
+                                frame: anchor_templates(&impl_frame),
                             },
                         ))
                     })
@@ -1022,10 +1069,10 @@ fn build_packages(
                     .or_default()
                     .push(ProgramImplRule {
                         interface_head,
-                        for_ty_pattern: for_ty_pattern.clone(),
+                        for_ty_pattern: anchor_template(&for_ty_pattern),
                         generic_param_bounds: generic_param_bounds.clone(),
-                        interface_args,
-                        interface_assoc,
+                        interface_args: anchor_templates(&interface_args),
+                        interface_assoc: anchor_named_templates(&interface_assoc),
                         methods,
                         field_links,
                     });
@@ -1498,7 +1545,7 @@ pub fn reuse_throws_mismatches(
     prev_units: &[CompilationUnit],
     clean_files: &HashSet<String>,
 ) -> HashMap<String, String> {
-    let previous: HashMap<&str, &baml_type::TyTemplate> = prev_units
+    let previous: HashMap<&str, &bex_vm_types::TyTemplate> = prev_units
         .iter()
         .flat_map(|unit| &unit.code)
         .filter_map(|object| match object {
@@ -2224,7 +2271,7 @@ fn tail_generic_dupes_clean(
 ) -> bool {
     // (base fn fq name, type args) of every generic value clean files own.
     // `GenericFunction::type_args` is `RealizedTy` (runtime narrowing, #3998).
-    let mut clean_keys: Vec<(String, Vec<baml_type::RealizedTy>)> = Vec::new();
+    let mut clean_keys: Vec<(String, Vec<bex_vm_types::RealizedTy>)> = Vec::new();
     for unit in prev_units {
         if !effective_clean.contains(&unit.source_file) {
             continue;
@@ -2647,7 +2694,7 @@ fn generate_impl(
         // precompiled slice; whole-program products it carries (template
         // macros, packages) are recomputed by the trailing passes below,
         // exactly as a full compile would.
-        Some(base) => (base.clone(), EmitTables::from_stdlib_program(base)),
+        Some(base) => (base.clone(), EmitTables::from_stdlib_program(base)?),
         None => (Program::new(), EmitTables::default()),
     };
     if base.is_none() {
@@ -2741,6 +2788,12 @@ struct EmitTables {
     classes: HashMap<String, HashMap<String, usize>>,
     /// Class fq-name → `ObjectPool` index (Pass 2).
     class_object_indices: HashMap<String, usize>,
+    /// Class fq name → its fields' *name-headed* types, captured in Pass 2
+    /// before anchoring. This is [`ClassFieldSnapshot`]'s backing store: MIR
+    /// codegen reasons in names, and recovering them from the pooled (anchored)
+    /// form is not always possible — a field type may reference a declaration a
+    /// later file group emits.
+    class_fields_named: ClassFieldSnapshot,
     /// Collision detector for content-addressed head type tags: tag → fq-name
     /// of the declaration that claimed it. Shared across every kind that can
     /// head a nominal type — classes (Pass 2), enums (Pass 3), interfaces —
@@ -2774,7 +2827,13 @@ impl EmitTables {
     /// per declaring file (Pass 3c) and the builtin group is not re-emitted on
     /// this path; the spliced pool preserves the base's object indices, so the
     /// entries stay valid exactly as the class/enum/interface ones do.
-    fn from_stdlib_program(base: &Program) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`LoweringError::Internal`] if a pooled class field names a head no
+    /// declaration in `base` claims — the slice is not self-contained, and the
+    /// name-headed snapshot below cannot be rebuilt from it.
+    fn from_stdlib_program(base: &Program) -> Result<Self, LoweringError> {
         let mut tables = EmitTables::default();
 
         for (name, &slot) in &base.function_global_indices {
@@ -2783,6 +2842,23 @@ impl EmitTables {
         for (name, &slot) in &base.let_global_indices {
             tables.globals.insert(name.clone(), slot);
         }
+
+        // Every head the slice's own declarations can name. Recovering names by
+        // walking the pool is sound *here*, unlike in Pass 2: the stdlib slice
+        // is complete and self-contained — builtins are lowered before any user
+        // file exists, so no builtin field can reference a declaration outside
+        // it.
+        let base_head_names: HashMap<baml_type::typetag::TypeTag, baml_type::TypeName> = base
+            .objects
+            .iter()
+            .filter_map(|obj| match obj {
+                Object::Class(c) => Some((c.type_tag, c.name.clone())),
+                Object::Enum(e) => Some((e.type_tag, e.name.clone())),
+                Object::Interface(i) => Some((i.type_tag, i.name.clone())),
+                Object::TypeAlias(a) => Some((a.type_tag, a.name.clone())),
+                _ => None,
+            })
+            .collect();
 
         for (idx, obj) in base.objects.iter().enumerate() {
             match obj {
@@ -2794,8 +2870,33 @@ impl EmitTables {
                         .enumerate()
                         .map(|(i, f)| (f.name.clone(), i))
                         .collect();
+                    // Function-body codegen reasons in names, so the pooled
+                    // head-anchored field types are named again. Without this
+                    // the user group loses every builtin class's field names and
+                    // silently emits index annotations where a full compile
+                    // emits `.field` — see `EmitTables::class_fields_named`.
+                    let named_fields = class
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            let named = f.field_type.try_map_heads(&mut |head| {
+                                base_head_names.get(&head.tag()).cloned().ok_or_else(|| {
+                                    LoweringError::Internal(format!(
+                                        "stdlib slice is not self-contained: class `{}` \
+                                         field `{}` names head #{}, which no pooled \
+                                         declaration claims",
+                                        class.name,
+                                        f.name,
+                                        head.tag().as_i64(),
+                                    ))
+                                })
+                            })?;
+                            Ok((f.name.clone(), named))
+                        })
+                        .collect::<Result<Vec<_>, LoweringError>>()?;
                     tables.classes.insert(fq.clone(), field_indices);
                     tables.class_object_indices.insert(fq.clone(), idx);
+                    tables.class_fields_named.insert(fq.clone(), named_fields);
                     tables.type_tags.insert(class.type_tag, fq);
                 }
                 Object::Enum(enum_def) => {
@@ -2828,7 +2929,7 @@ impl EmitTables {
             })
             .collect();
 
-        tables
+        Ok(tables)
     }
 }
 
@@ -2848,7 +2949,7 @@ impl EmitTables {
 fn spliced_throws_match(
     db: &dyn baml_compiler2_mir::Db,
     file: baml_base::SourceFile,
-    previous: &HashMap<&str, &baml_type::TyTemplate>,
+    previous: &HashMap<&str, &bex_vm_types::TyTemplate>,
     cache: &ResolvedAliases,
 ) -> Result<(), String> {
     for &func_loc in file_functions(db, file) {
@@ -2872,7 +2973,7 @@ fn spliced_throws_match(
             cache,
             &baml_compiler2_tir::function_generic_params(db, func_loc),
         );
-        if **previous_throws != current_throws {
+        if **previous_throws != anchor_template(&current_throws) {
             return Err(format!(
                 "function `{fq}` changed from {:?} to {current_throws:?}",
                 **previous_throws
@@ -2903,6 +3004,7 @@ fn emit_file_group(
         globals,
         classes,
         class_object_indices,
+        class_fields_named,
         type_tags,
         enum_variants,
         enum_object_indices,
@@ -3011,6 +3113,11 @@ fn emit_file_group(
 
             let mut field_indices = HashMap::new();
             let mut fields = Vec::new();
+            // The same field types before anchoring — the snapshot MIR codegen
+            // reads, kept here rather than recovered from the pool: a field type
+            // may reference a declaration this group has not emitted yet, so the
+            // inverse lookup is not always available.
+            let mut named_fields: Vec<(String, RuntimeTy)> = Vec::new();
             // Class-level generic params, used to resolve `T`-references in
             // field type expressions to `TyTemplate::TypeArgRef(N)`.  When
             // empty, `tir2_to_template` produces a `Concrete`-equivalent leaf
@@ -3060,10 +3167,11 @@ fn emit_file_group(
                     }
                 };
                 let (field_desc, field_alias, field_skip) = extract_schema_attrs(attrs.as_slice());
+                named_fields.push((name.clone(), field_type.clone()));
                 fields.push(ClassField {
                     name: name.clone(),
-                    field_type,
-                    field_template,
+                    field_type: anchor_runtime(&field_type),
+                    field_template: anchor_template(&field_template),
                     description: field_desc,
                     alias: field_alias,
                     skip: field_skip,
@@ -3165,6 +3273,20 @@ fn emit_file_group(
             class_object_indices
                 .entry(short_name.clone())
                 .or_insert(class_obj_idx);
+            // Field metadata is keyed under all three names, and with the same
+            // precedence, because codegen reaches it by whichever name the MIR
+            // it is walking happens to carry — a fully-qualified one from an
+            // inter-package reference, a display one from a type check, a short
+            // one from an aggregate. Keying it any less than
+            // `class_object_indices` makes the lookup silently miss and the
+            // field render as its index.
+            class_fields_named.insert(fq_name.clone(), named_fields.clone());
+            class_fields_named
+                .entry(display_name.clone())
+                .or_insert_with(|| named_fields.clone());
+            class_fields_named
+                .entry(short_name.clone())
+                .or_insert(named_fields);
             // The display- and short-name maps must agree with the emitted
             // runtime field indices used by the Class object above. Use a
             // closure that rebuilds the same ordering.
@@ -3275,25 +3397,6 @@ fn emit_file_group(
         }
     }
 
-    // Read-only snapshot of pooled class field metadata for function-body
-    // codegen, built after Pass 3b so it covers every alias registered in
-    // `class_object_indices` (including classes minted by earlier file
-    // groups). See [`ClassFieldSnapshot`].
-    let class_fields: ClassFieldSnapshot = class_object_indices
-        .iter()
-        .filter_map(|(name, &idx)| match program.objects.get(idx) {
-            Some(Object::Class(class)) => Some((
-                name.clone(),
-                class
-                    .fields
-                    .iter()
-                    .map(|f| (f.name.clone(), f.field_type.clone()))
-                    .collect(),
-            )),
-            _ => None,
-        })
-        .collect();
-
     // --- Pass 3c: Recursive type alias definitions ---
     // Each recursive alias becomes an `Object::TypeAlias` so a package can
     // reference it by index (non-recursive aliases are expanded inline at
@@ -3316,11 +3419,24 @@ fn emit_file_group(
             // cache would re-emit an imported alias under every importer. Walking
             // declarations instead emits each alias exactly once, in the file that
             // declares it — which is also what per-file dirty tracking needs.
-            if !cache.recursive.contains(&qtn) || !emitted_aliases.insert(qtn.clone()) {
+            // Pool an alias whenever a reference to it can survive lowering.
+            // That is every recursive alias — expanding one diverges — and also
+            // any alias the package's expansion cache does not carry, since
+            // lowering leaves *those* references standing too. Synthetic
+            // `*$stream` companions are the case in practice: they are recursive
+            // exactly when the alias they shadow is, but never reach the cache,
+            // so without this a class field would name a head with no
+            // declaration to point at.
+            let expandable = cache.aliases.contains_key(&qtn);
+            if (expandable && !cache.recursive.contains(&qtn))
+                || !emitted_aliases.insert(qtn.clone())
+            {
                 continue;
             }
-            let tir_ty = &cache.aliases[&qtn];
-            let mir_ty = cache.convert(tir_ty);
+            // Read the body from the declaration rather than the cache, which by
+            // construction may not hold it.
+            let resolved = baml_compiler2_tir::inference::resolve_type_alias(db, alias_loc);
+            let mir_ty = cache.convert(&resolved.ty);
             // Aliases have no type-parameter list, so nothing is in scope for the
             // right-hand side to reference — a non-realized alias body means
             // lowering produced something impossible, not a program to carry.
@@ -3337,7 +3453,7 @@ fn emit_file_group(
                 bex_vm_types::types::TypeAliasDef {
                     name: qtn.clone(),
                     type_tag: claim_type_tag(type_tags, &fq_name)?,
-                    definition,
+                    definition: anchor_realized(&definition),
                 },
             )));
             program_packages
@@ -3353,6 +3469,10 @@ fn emit_file_group(
                 );
         }
     }
+
+    // The class-field snapshot function-body codegen reads. Captured in Pass 2
+    // rather than recovered from the pool: see `EmitTables::class_fields_named`.
+    let class_fields: ClassFieldSnapshot = class_fields_named.clone();
 
     // --- Pass 4: Compile each function ---
     if rayon::current_num_threads() > 1 {
@@ -3709,10 +3829,10 @@ fn compute_throws_type(
 /// by MIR's `lower_lambda` on `MirFunction::signature`).
 fn apply_signature_metadata(f: &mut Function, sig: &baml_compiler2_mir::RuntimeSignature) {
     f.param_names.clone_from(&sig.param_names);
-    f.param_types.clone_from(&sig.param_types);
+    f.param_types = anchor_templates(&sig.param_types);
     f.param_has_default.clone_from(&sig.param_has_default);
-    f.return_type = sig.return_type.clone();
-    f.throws_type.clone_from(&sig.throws_type);
+    f.return_type = anchor_template(&sig.return_type);
+    f.throws_type = anchor_template(&sig.throws_type);
     f.docstring.clone_from(&sig.docstring);
     f.declared_name.clone_from(&sig.name);
     f.display_type_params.clone_from(&sig.display_type_params);
@@ -5033,7 +5153,7 @@ struct GenericFunctionInterner {
 }
 
 /// One interned instantiation: its type arguments and its final pool index.
-type InternedGenericFunction = (Box<[baml_type::RealizedTy]>, usize);
+type InternedGenericFunction = (Box<[bex_vm_types::RealizedTy]>, usize);
 
 impl GenericFunctionInterner {
     fn get(&self, gf: &bex_vm_types::GenericFunction) -> Option<usize> {

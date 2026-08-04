@@ -16,11 +16,10 @@
 //! local operands through the existing `relink` operand walkers.
 //!
 use baml_base::Name;
-use baml_type::{RealizedTy, TyTemplate};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    Object, TestCase,
+    Object, RealizedTy, TestCase, TyTemplate,
     types::{InterfaceBound, LocalName},
 };
 

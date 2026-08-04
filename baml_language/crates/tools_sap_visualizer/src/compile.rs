@@ -82,6 +82,33 @@ pub fn compile_baml_to_sap(baml_source: &str, type_expr: &str) -> Result<Compile
     let mut enum_defs: IndexMap<TypeName, sys_types::EnumDefinition> = IndexMap::new();
     let mut parse_field_ty: Option<baml_type::RuntimeTy> = None;
 
+    // A compiled `Program`'s types are head-anchored, and its heads are
+    // unresolved (there is no heap here), so they are named again through the
+    // pool's own declarations — every one carries both its `TypeName` and its
+    // `type_tag`.
+    let head_names: std::collections::HashMap<baml_type::typetag::TypeTag, baml_type::TypeName> =
+        program
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                bex_vm_types::Object::Class(c) => Some((c.type_tag, c.name.clone())),
+                bex_vm_types::Object::Enum(e) => Some((e.type_tag, e.name.clone())),
+                bex_vm_types::Object::Interface(i) => Some((i.type_tag, i.name.clone())),
+                bex_vm_types::Object::TypeAlias(a) => Some((a.type_tag, a.name.clone())),
+                _ => None,
+            })
+            .collect();
+    let named = |ty: &bex_vm_types::RuntimeTy| -> Result<baml_type::RuntimeTy, String> {
+        ty.try_map_heads(&mut |head| {
+            head_names.get(&head.tag()).cloned().ok_or_else(|| {
+                format!(
+                    "type head #{} names no pooled declaration",
+                    head.tag().as_i64()
+                )
+            })
+        })
+    };
+
     for obj in &program.objects {
         match obj {
             bex_vm_types::Object::Class(cls) if cls.name.package() != "baml" => {
@@ -94,7 +121,7 @@ pub fn compile_baml_to_sap(baml_source: &str, type_expr: &str) -> Result<Compile
                         .ok_or_else(|| {
                             format!("Synthetic class {PARSE_CLASS} missing field {PARSE_FIELD}")
                         })?;
-                    parse_field_ty = Some(field.field_type.clone());
+                    parse_field_ty = Some(named(&field.field_type)?);
                     // Don't add the synthetic class to the definitions.
                     continue;
                 }
@@ -108,14 +135,16 @@ pub fn compile_baml_to_sap(baml_source: &str, type_expr: &str) -> Result<Compile
                         fields: cls
                             .fields
                             .iter()
-                            .map(|f| sys_types::ClassFieldDefinition {
-                                name: f.name.clone(),
-                                field_type: f.field_type.clone(),
-                                description: f.description.clone(),
-                                alias: f.alias.clone(),
-                                skip: f.skip,
+                            .map(|f| {
+                                Ok(sys_types::ClassFieldDefinition {
+                                    name: f.name.clone(),
+                                    field_type: named(&f.field_type)?,
+                                    description: f.description.clone(),
+                                    alias: f.alias.clone(),
+                                    skip: f.skip,
+                                })
                             })
-                            .collect(),
+                            .collect::<Result<_, String>>()?,
                     },
                 );
             }
@@ -149,8 +178,18 @@ pub fn compile_baml_to_sap(baml_source: &str, type_expr: &str) -> Result<Compile
     let type_alias_definitions = program
         .recursive_type_aliases()
         .into_iter()
-        .map(|(name, ty)| (name, baml_type::RuntimeTy::from(ty)))
-        .collect();
+        .map(|(name, ty)| {
+            let named_realized = ty.try_map_heads(&mut |head: &bex_vm_types::TypeHead| {
+                head_names.get(&head.tag()).cloned().ok_or_else(|| {
+                    format!(
+                        "type head #{} names no pooled declaration",
+                        head.tag().as_i64()
+                    )
+                })
+            })?;
+            Ok((name, baml_type::RuntimeTy::from(named_realized)))
+        })
+        .collect::<Result<_, String>>()?;
     let type_ctx =
         sap_model::TypeCtx::new(&class_defs, Arc::new(enum_defs), &type_alias_definitions);
 

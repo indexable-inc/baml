@@ -20,13 +20,16 @@ fn generic_function_indices_mentioning(
     program: &bex_vm_types::Program,
     needle: &str,
 ) -> Vec<usize> {
+    // Names come from the pool: the program has not been loaded, so its heads
+    // hold identity without a pointer and would render as bare tags.
+    let heads = bex_vm::debug::HeadNames::of(program);
     let mut indices = Vec::new();
     for i in 0..program.objects.len() {
         if let Some(Object::GenericFunction(gf)) = program.objects.get(i) {
             let args = gf
                 .type_args
                 .iter()
-                .map(ToString::to_string)
+                .map(|ty| heads.realized(ty).to_string())
                 .collect::<Vec<_>>()
                 .join(",");
             if args.contains(needle) {

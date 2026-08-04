@@ -129,13 +129,16 @@ fn compiled_function_metadata(source: &str, display_name_suffix: &str) -> (Vec<S
         panic!("`{name}` did not point at a function object");
     };
 
+    // Names come from the pool: the program has not been loaded, so its heads
+    // hold identity without a pointer and would render as bare tags.
+    let heads = bex_vm::debug::HeadNames::of(&program);
     (
         function
             .param_types
             .iter()
-            .map(ToString::to_string)
+            .map(|ty| heads.template(ty).to_string())
             .collect(),
-        function.return_type.to_string(),
+        heads.template(&function.return_type).to_string(),
     )
 }
 

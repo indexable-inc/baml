@@ -246,6 +246,7 @@ fn find_perfect_hash(keys: &[(i64, usize)]) -> Option<PerfectHashResult> {
 use crate::{
     MirCodegenContext,
     analysis::{AnalysisResult, LocalClassification, StatementRef},
+    anchor_template, anchor_templates,
     pull_semantics::{
         self, LocalAssignBehavior, LocalPullAction, LocalStoreBehavior, PullSink, StackEffectSink,
     },
@@ -1446,7 +1447,8 @@ impl<'ctx, 'obj> StackifyCodegen<'ctx, 'obj> {
                 // the interface, the value, and the receiver in that order.
                 self.emit_operand_pull(receiver);
                 self.emit_operand_pull(value);
-                let iface_const = self.add_constant(ConstValue::Type(iface.to_template()));
+                let iface_const =
+                    self.add_constant(ConstValue::Type(anchor_template(&iface.to_template())));
                 let inst = self.emit(Instruction::LoadType(iface_const));
                 self.set_operand(inst, OperandMeta::Const(iface.to_string()));
                 let inst = self.emit(Instruction::VirtualStoreField(*field_index as usize));
@@ -1873,11 +1875,12 @@ impl<'ctx, 'obj> StackifyCodegen<'ctx, 'obj> {
             // by `LoadType`), then the method name — the opcode pops in reverse.
             self.emit_operand_pull(receiver);
             for template in type_args {
-                let const_idx = self.add_constant(ConstValue::Type(template.clone()));
+                let const_idx = self.add_constant(ConstValue::Type(anchor_template(template)));
                 let inst = self.emit(Instruction::LoadType(const_idx));
                 self.set_operand(inst, OperandMeta::Const(template.to_string()));
             }
-            let iface_const = self.add_constant(ConstValue::Type(iface.to_template()));
+            let iface_const =
+                self.add_constant(ConstValue::Type(anchor_template(&iface.to_template())));
             let inst = self.emit(Instruction::LoadType(iface_const));
             self.set_operand(inst, OperandMeta::Const(iface.to_string()));
             self.emit_constant(&Constant::String(method.clone()));
@@ -1897,7 +1900,8 @@ impl<'ctx, 'obj> StackifyCodegen<'ctx, 'obj> {
             // Stack: receiver, then the interface type (resolved against the frame
             // by `LoadType`) — the opcode pops the interface, then the receiver.
             self.emit_operand_pull(receiver);
-            let iface_const = self.add_constant(ConstValue::Type(iface.to_template()));
+            let iface_const =
+                self.add_constant(ConstValue::Type(anchor_template(&iface.to_template())));
             let inst = self.emit(Instruction::LoadType(iface_const));
             self.set_operand(inst, OperandMeta::Const(iface.to_string()));
             let inst = self.emit(Instruction::VirtualLoadField(*field_index as usize));
@@ -1933,19 +1937,25 @@ impl<'ctx, 'obj> StackifyCodegen<'ctx, 'obj> {
             .get(&name_str)
             .unwrap_or_else(|| panic!("undefined function: {name_str}"));
         let gidx = GlobalIndex::from_raw(global_idx);
+        // Pool objects carry heads; the interning comparison must therefore run
+        // over the anchored form, or every instantiation would look distinct.
+        let anchored: Vec<bex_vm_types::RealizedTy> = type_args
+            .iter()
+            .map(|arg| arg.map_heads(&mut bex_vm_types::TypeHead::of_name))
+            .collect();
         let existing = self
             .objects
             .iter()
             .position(|o| {
                 matches!(o, Object::GenericFunction(gf)
-                if gf.function == gidx && gf.type_args.as_ref() == type_args)
+                if gf.function == gidx && gf.type_args.as_ref() == anchored)
             })
             .map(|local| self.objects_base + local);
         let pool_idx = match existing {
             Some(idx) => idx,
             None => self.mint_object(Object::GenericFunction(bex_vm_types::GenericFunction {
                 function: gidx,
-                type_args: type_args.to_vec().into_boxed_slice(),
+                type_args: anchored.into_boxed_slice(),
             })),
         };
         let const_idx = self.add_constant(ConstValue::Object(ObjectIndex::from_raw(pool_idx)));
@@ -2308,7 +2318,8 @@ impl<'ctx, 'obj> StackifyCodegen<'ctx, 'obj> {
                 // interface, then the `ntypeargs` method type args, then reads the
                 // receiver (first value arg) to resolve the impl at runtime.
                 unwrap_infallible(pull_semantics::walk_call_direct_args(self, args));
-                let iface_const = self.add_constant(ConstValue::Type(iface.to_template()));
+                let iface_const =
+                    self.add_constant(ConstValue::Type(anchor_template(&iface.to_template())));
                 let inst = self.emit(Instruction::LoadType(iface_const));
                 self.set_operand(inst, OperandMeta::Const(iface.to_string()));
                 self.emit_constant(&Constant::String(method.clone()));
@@ -3378,7 +3389,7 @@ impl PullSink for StackifyCodegen<'_, '_> {
         // arg-discriminating check a coarse type tag cannot express (`int[]` ≠
         // `string[]`, `map<string,int>` ≠ `map<string,string>`, a realized `T[]`).
         let emit_structural = |this: &mut Self, template: &TyTemplate| {
-            let c = this.add_constant(ConstValue::Type(template.clone()));
+            let c = this.add_constant(ConstValue::Type(anchor_template(template)));
             let inst = this.emit(Instruction::IsType(c));
             this.set_operand(inst, OperandMeta::Const(template.to_string()));
         };
@@ -3402,7 +3413,7 @@ impl PullSink for StackifyCodegen<'_, '_> {
                 } else {
                     let c = self.add_constant(ConstValue::ClassWithTypeArgs {
                         class_obj: ObjectIndex::from_raw(class_obj_idx),
-                        type_args_templates: type_args_templates.clone(),
+                        type_args_templates: anchor_templates(type_args_templates),
                     });
                     let inst = self.emit(Instruction::IsType(c));
                     self.set_operand(inst, OperandMeta::Const(format!("{class_name_str}<...>")));
@@ -3520,7 +3531,7 @@ impl PullSink for StackifyCodegen<'_, '_> {
     }
 
     fn load_type(&mut self, template: &TyTemplate) -> Result<(), Self::Error> {
-        let const_idx = self.add_constant(ConstValue::Type(template.clone()));
+        let const_idx = self.add_constant(ConstValue::Type(anchor_template(template)));
         let inst = self.emit(Instruction::LoadType(const_idx));
         self.set_operand(inst, OperandMeta::Const(template.to_string()));
         Ok(())

@@ -316,10 +316,16 @@ impl TraceSnapshotBuilder {
                         .collect();
                     self.alloc(TraceValue::Instance {
                         type_name: class.name.to_string(),
+                        // Trace payloads are host-facing; a live instance's args
+                        // were resolved at load, so naming cannot fail here.
                         type_args: instance
                             .class_type_args
                             .iter()
-                            .map(baml_type::RuntimeTy::from)
+                            .map(|arg| {
+                                bex_vm_types::name_headed_realized(arg)
+                                    .map(baml_type::RuntimeTy::from)
+                                    .unwrap_or_else(|e| unreachable!("traced instance carries {e}"))
+                            })
                             .collect(),
                         fields,
                     })

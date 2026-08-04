@@ -16,7 +16,8 @@
 
 use std::sync::Arc;
 
-use baml_type::{MediaKind, RealizedTy, TyTemplate, TypeName};
+use baml_type::{MediaKind, TypeName};
+use bex_vm_types::{RealizedTy, TyTemplate};
 
 /// FQN of the recursive `json` type alias declared in `baml.json`.
 /// Mirrors `baml_base::qualified_name::BAML_JSON_JSON`; inlined here to
@@ -29,7 +30,8 @@ const BAML_JSON_JSON: &str = "baml.json.json";
 /// element/value type available for containers parsed from untyped JSON.
 pub(super) fn json_alias_ty() -> RealizedTy {
     RealizedTy::TypeAlias(
-        TypeName::from_dotted_path(BAML_JSON_JSON),
+        // Unresolved: this is used for comparison, and identity is the tag.
+        bex_vm_types::TypeHead::of_name(&TypeName::from_dotted_path(BAML_JSON_JSON)),
         baml_type::TyAttr::default(),
     )
 }
@@ -58,8 +60,11 @@ where
 /// We rebuild that form here from `module_path + name`; for builtin types
 /// (where `display_name` already encodes the full path) this also works
 /// because `module_path` is the same path split on dots.
-fn class_lookup_key(qtn: &TypeName) -> String {
-    qtn.render_dotted(false)
+fn class_lookup_key(qtn: &bex_vm_types::TypeHead) -> String {
+    // The head names its own declaration, so the fully-qualified spelling comes
+    // from the declaration rather than being rebuilt from parts.
+    qtn.declared_name()
+        .map_or_else(|| qtn.to_string(), |name| name.render_dotted(false))
 }
 use std::collections::HashMap;
 
@@ -938,7 +943,7 @@ fn ty_value_to_serde(
 fn serialize_class_instance(
     vm: &mut BexVm,
     value: Value,
-    qtn: &TypeName,
+    qtn: &bex_vm_types::TypeHead,
     path: &mut String,
 ) -> Result<serde_json::Value, VmRustFnError> {
     let inst_ptr = match value.as_object_ptr() {
@@ -1310,7 +1315,7 @@ fn ty_serde_to_value(
 fn deserialize_class_instance(
     vm: &mut BexVm,
     json: &serde_json::Value,
-    qtn: &TypeName,
+    qtn: &bex_vm_types::TypeHead,
     type_args: &[RealizedTy],
     path: &mut String,
 ) -> Result<Value, VmRustFnError> {
@@ -1326,7 +1331,7 @@ fn deserialize_class_instance(
     };
 
     let class_ptr = vm
-        .lookup_type(qtn)
+        .declaration(*qtn)
         .ok_or_else(|| raise_decode(vm, format!("class `{qtn}` not found"), path))?;
     let class_fields = match vm.get_object(class_ptr) {
         Object::Class(c) => c.fields.clone(),
@@ -1372,12 +1377,12 @@ fn deserialize_class_instance(
 
 fn deserialize_enum_variant(
     vm: &mut BexVm,
-    qtn: &TypeName,
+    qtn: &bex_vm_types::TypeHead,
     variant_name: &str,
     path: &mut String,
 ) -> Result<Value, VmRustFnError> {
     let enm_ptr = vm
-        .lookup_type(qtn)
+        .declaration(*qtn)
         .ok_or_else(|| raise_decode(vm, format!("enum `{qtn}` not found"), path))?;
     let idx = match vm.get_object(enm_ptr) {
         Object::Enum(e) => e.variants.iter().position(|v| v.name == variant_name),
@@ -1415,7 +1420,7 @@ fn deserialize_media_by_kind(
         }
     };
     let fqn_string = format!("baml.media.{class_short}");
-    let qtn = TypeName::from_dotted_path(&fqn_string);
+    let qtn = bex_vm_types::TypeHead::of_name(&TypeName::from_dotted_path(&fqn_string));
     deserialize_media(vm, json, kind, &qtn, path)
 }
 
@@ -1423,7 +1428,7 @@ fn deserialize_media(
     vm: &mut BexVm,
     json: &serde_json::Value,
     kind: MediaKind,
-    qtn: &TypeName,
+    qtn: &bex_vm_types::TypeHead,
     path: &mut String,
 ) -> Result<Value, VmRustFnError> {
     let map = match json {
@@ -1460,7 +1465,7 @@ fn deserialize_media(
     };
 
     let class_ptr = vm
-        .lookup_type(qtn)
+        .declaration(*qtn)
         .ok_or_else(|| raise_decode(vm, format!("media class `{qtn}` not found"), path))?;
     let data_val = Value::object(vm.alloc_rust_data(media_arc));
     Ok(Value::object(vm.alloc_instance(class_ptr, vec![data_val])))
@@ -1564,7 +1569,7 @@ fn json_to_dispatch(vm: &mut BexVm, j: Value, ty: &RealizedTy) -> NativeCallResu
 fn class_from_json_start(
     vm: &mut BexVm,
     j: Value,
-    qtn: &TypeName,
+    qtn: &bex_vm_types::TypeHead,
     type_args: &[RealizedTy],
 ) -> NativeCallResult {
     let map: IndexMap<bex_vm_types::BexStr, Value> = match j.as_object_ptr() {
@@ -1586,7 +1591,7 @@ fn class_from_json_start(
             ));
         }
     };
-    let class_ptr = match vm.lookup_type(qtn) {
+    let class_ptr = match vm.declaration(*qtn) {
         Some(p) => p,
         None => {
             return NativeCallResult::Error(raise_decode(

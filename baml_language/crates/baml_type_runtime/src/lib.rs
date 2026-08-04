@@ -29,7 +29,7 @@ use baml_type::Name;
     reason = "fact-free by necessity: inference runs at the host entry boundary (no VM exists yet) and shares its lattice with compile-time inference — both sides must gain real fact contexts in lockstep"
 )]
 use baml_type::normalize::NoFacts;
-use baml_type::{ParamTy, Ty, TyAttr, normalize::TypeContext};
+use baml_type::{Head, ParamTy, Ty, TyAttr, normalize::TypeContext};
 use rustc_hash::FxHashMap;
 
 // ── Inference options ─────────────────────────────────────────────────────────
@@ -110,12 +110,21 @@ pub struct InferError {
 /// reached through, in encounter order. Drive it across every argument of a call
 /// (one [`record`](Self::record) per arg), then [`solve`](Self::solve) once so
 /// conflicting occurrences across *different* arguments are caught.
-#[derive(Default)]
-pub struct InferenceConstraints {
-    vars: FxHashMap<ParamTy, Vec<(Variance, Ty)>>,
+pub struct InferenceConstraints<N: Head = baml_type::QualifiedTypeName> {
+    vars: FxHashMap<ParamTy, Vec<(Variance, Ty<N>)>>,
 }
 
-impl InferenceConstraints {
+// Hand-written: `derive(Default)` would demand `N: Default`, which a head is
+// not — an empty constraint set needs nothing from the head.
+impl<N: Head> Default for InferenceConstraints<N> {
+    fn default() -> Self {
+        Self {
+            vars: FxHashMap::default(),
+        }
+    }
+}
+
+impl<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName> InferenceConstraints<N> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -123,7 +132,7 @@ impl InferenceConstraints {
     /// Record the occurrences of every `TypeVar` in `formal` against `actual`,
     /// starting from a covariant root. Uses the runtime leaf decisions (a
     /// `TypeVar` actual / `Unknown` carries no information).
-    pub fn record(&mut self, formal: &Ty, actual: &Ty) {
+    pub fn record(&mut self, formal: &Ty<N>, actual: &Ty<N>) {
         collect(
             formal,
             actual,
@@ -133,7 +142,7 @@ impl InferenceConstraints {
         );
     }
 
-    fn record_with(&mut self, formal: &Ty, actual: &Ty, opts: InferOpts<'_>) {
+    fn record_with(&mut self, formal: &Ty<N>, actual: &Ty<N>, opts: InferOpts<'_>) {
         collect(formal, actual, Variance::Covariant, &mut self.vars, opts);
     }
 
@@ -142,10 +151,10 @@ impl InferenceConstraints {
     /// This is the compile-time path: it preserves today's behavior and leans on
     /// the variance-aware downstream subtyping checks to reject the unsound
     /// joins. The runtime path uses [`solve`](Self::solve) instead.
-    fn solve_best_effort(&self) -> FxHashMap<ParamTy, Ty> {
+    fn solve_best_effort(&self) -> FxHashMap<ParamTy, Ty<N>> {
         let mut out = FxHashMap::default();
         for (name, occ) in &self.vars {
-            let mut acc: Option<Ty> = None;
+            let mut acc: Option<Ty<N>> = None;
             for (_, ty) in occ {
                 acc = Some(match acc {
                     None => ty.clone(),
@@ -166,7 +175,7 @@ impl InferenceConstraints {
     /// `join(lowers) <: T <: meet(uppers)` and every equality member mutually
     /// equal and consistent with the bounds; otherwise the var has no solution
     /// and the whole inference fails. On success, returns the resolved bindings.
-    pub fn solve(&self) -> Result<FxHashMap<ParamTy, Ty>, InferError> {
+    pub fn solve(&self) -> Result<FxHashMap<ParamTy, Ty<N>>, InferError> {
         let mut out = FxHashMap::default();
         for (name, occ) in &self.vars {
             if let Some(ty) = solve_var(name, occ)? {
@@ -182,10 +191,13 @@ impl InferenceConstraints {
     deprecated,
     reason = "fact-free by necessity: this solver runs at the host entry boundary (no VM exists yet) and shares its lattice with compile-time inference — both sides must gain real fact contexts in lockstep"
 )]
-fn solve_var(param: &ParamTy, occ: &[(Variance, Ty)]) -> Result<Option<Ty>, InferError> {
-    let mut lowers: Vec<&Ty> = Vec::new();
-    let mut uppers: Vec<&Ty> = Vec::new();
-    let mut equals: Vec<&Ty> = Vec::new();
+fn solve_var<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    param: &ParamTy,
+    occ: &[(Variance, Ty<N>)],
+) -> Result<Option<Ty<N>>, InferError> {
+    let mut lowers: Vec<&Ty<N>> = Vec::new();
+    let mut uppers: Vec<&Ty<N>> = Vec::new();
+    let mut equals: Vec<&Ty<N>> = Vec::new();
     for (variance, ty) in occ {
         match variance {
             Variance::Covariant => lowers.push(ty),
@@ -203,7 +215,7 @@ fn solve_var(param: &ParamTy, occ: &[(Variance, Ty)]) -> Result<Option<Ty>, Infe
 
     // Invariant occurrences must be rigidly equal to one another (canonical
     // equivalence: coercion-free, union-order-insensitive).
-    let rigid: Option<Ty> = match equals.split_first() {
+    let rigid: Option<Ty<N>> = match equals.split_first() {
         None => None,
         Some((first, rest)) => {
             for other in rest {
@@ -266,8 +278,10 @@ fn solve_var(param: &ParamTy, occ: &[(Variance, Ty)]) -> Result<Option<Ty>, Infe
 }
 
 /// Join a set of lower bounds into a single type (their union), or `None` if empty.
-fn join_all(tys: &[&Ty]) -> Option<Ty> {
-    let mut acc: Option<Ty> = None;
+fn join_all<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    tys: &[&Ty<N>],
+) -> Option<Ty<N>> {
+    let mut acc: Option<Ty<N>> = None;
     for ty in tys {
         acc = Some(match acc {
             None => (*ty).clone(),
@@ -280,8 +294,11 @@ fn join_all(tys: &[&Ty]) -> Option<Ty> {
 /// Meet a set of upper bounds. Returns `None` if empty. Fails if the meet
 /// collapses to `Never` (irreconcilable contravariant occurrences, e.g. a `T`
 /// required to be `<: int` *and* `<: string`).
-fn meet_all(param: &ParamTy, tys: &[&Ty]) -> Result<Option<Ty>, InferError> {
-    let mut acc: Option<Ty> = None;
+fn meet_all<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    param: &ParamTy,
+    tys: &[&Ty<N>],
+) -> Result<Option<Ty<N>>, InferError> {
+    let mut acc: Option<Ty<N>> = None;
     for ty in tys {
         acc = Some(match acc {
             None => (*ty).clone(),
@@ -310,7 +327,10 @@ fn meet_all(param: &ParamTy, tys: &[&Ty]) -> Result<Option<Ty>, InferError> {
     deprecated,
     reason = "fact-free by necessity — see the `NoFacts` import note"
 )]
-fn meet_ty(a: &Ty, b: &Ty) -> Ty {
+fn meet_ty<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    a: &Ty<N>,
+    b: &Ty<N>,
+) -> Ty<N> {
     if NoFacts.is_subtype(a, b) {
         a.clone()
     } else if NoFacts.is_subtype(b, a) {
@@ -332,11 +352,11 @@ fn meet_ty(a: &Ty, b: &Ty) -> Ty {
 /// matching structures, composing the current variance with the position's own
 /// variance (function parameters flip, container arguments go invariant). The
 /// solver later combines the recorded occurrences per their variance.
-fn collect(
-    formal: &Ty,
-    actual: &Ty,
+fn collect<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    formal: &Ty<N>,
+    actual: &Ty<N>,
     variance: Variance,
-    vars: &mut FxHashMap<ParamTy, Vec<(Variance, Ty)>>,
+    vars: &mut FxHashMap<ParamTy, Vec<(Variance, Ty<N>)>>,
     opts: InferOpts<'_>,
 ) {
     match (formal, actual) {
@@ -426,21 +446,21 @@ fn collect(
         (Ty::Union(f_members, _), _)
             if f_members.iter().any(|m| matches!(m, Ty::TypeVar(_, _))) =>
         {
-            let tv_members: Vec<&Ty> = f_members
+            let tv_members: Vec<&Ty<N>> = f_members
                 .iter()
                 .filter(|m| matches!(m, Ty::TypeVar(_, _)))
                 .collect();
             // Only an unambiguous single `TypeVar` member has a reasonable
             // candidate. More than one ⇒ ambiguous ⇒ bind nothing.
             if let [tv] = tv_members.as_slice() {
-                let concrete: Vec<&Ty> = f_members
+                let concrete: Vec<&Ty<N>> = f_members
                     .iter()
                     .filter(|m| !matches!(m, Ty::TypeVar(_, _)))
                     .collect();
                 // The residual is every actual atom NOT already explained by a
                 // concrete sibling (coercion-free subtype — `int` is NOT
                 // absorbed by a `float` sibling; see `covers`).
-                let residual: Vec<Ty> = union_atoms(actual)
+                let residual: Vec<Ty<N>> = union_atoms(actual)
                     .into_iter()
                     .filter(|atom| !concrete.iter().any(|c| covers(c, atom)))
                     .collect();
@@ -523,14 +543,16 @@ fn collect(
     }
 }
 
-fn nullable_non_null_part(ty: &Ty) -> Option<Ty> {
+fn nullable_non_null_part<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    ty: &Ty<N>,
+) -> Option<Ty<N>> {
     let Ty::Union(members, attr) = ty else {
         return None;
     };
-    if !members.iter().any(Ty::is_null) {
+    if !members.iter().any(Ty::<N>::is_null) {
         return None;
     }
-    let non_null: Vec<Ty> = members
+    let non_null: Vec<Ty<N>> = members
         .iter()
         .filter(|member| !member.is_null())
         .cloned()
@@ -549,7 +571,10 @@ fn nullable_non_null_part(ty: &Ty) -> Option<Ty> {
 /// literals, enums, variants — its catch-all no-op) never pair: collecting
 /// them binds nothing, so pairing one would only steal the slot from a
 /// genuine correspondent.
-fn heads_correspond(formal: &Ty, actual: &Ty) -> bool {
+fn heads_correspond<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    formal: &Ty<N>,
+    actual: &Ty<N>,
+) -> bool {
     match (formal, actual) {
         (Ty::Class(f, ..), Ty::Class(a, ..)) | (Ty::Interface(f, ..), Ty::Interface(a, ..)) => {
             f == a
@@ -566,7 +591,9 @@ fn heads_correspond(formal: &Ty, actual: &Ty) -> bool {
 /// its members (one level); anything else is a single atom. Used by the
 /// union-with-`TypeVar`-member inference arm to subtract concrete siblings atom
 /// by atom.
-fn union_atoms(actual: &Ty) -> Vec<Ty> {
+fn union_atoms<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    actual: &Ty<N>,
+) -> Vec<Ty<N>> {
     match actual {
         Ty::Union(members, _) => members.clone(),
         other => vec![other.clone()],
@@ -584,14 +611,20 @@ fn union_atoms(actual: &Ty) -> Vec<Ty> {
     deprecated,
     reason = "fact-free by necessity — see the `NoFacts` import note"
 )]
-fn covers(concrete: &Ty, atom: &Ty) -> bool {
+fn covers<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    concrete: &Ty<N>,
+    atom: &Ty<N>,
+) -> bool {
     NoFacts.is_subtype(atom, concrete)
 }
 
 /// Merge a fresh best-effort solve into an existing bindings map, unioning with
 /// any binding already present — preserving the cross-call accumulation the old
 /// `&mut`-threaded unifier provided (callers invoke it once per argument).
-fn merge_best_effort(bindings: &mut FxHashMap<ParamTy, Ty>, cons: &InferenceConstraints) {
+fn merge_best_effort<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    bindings: &mut FxHashMap<ParamTy, Ty<N>>,
+    cons: &InferenceConstraints<N>,
+) {
     for (name, ty) in cons.solve_best_effort() {
         bindings
             .entry(name)
@@ -600,16 +633,20 @@ fn merge_best_effort(bindings: &mut FxHashMap<ParamTy, Ty>, cons: &InferenceCons
     }
 }
 
-pub fn infer_bindings(formal: &Ty, actual: &Ty, bindings: &mut FxHashMap<ParamTy, Ty>) {
+pub fn infer_bindings<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    formal: &Ty<N>,
+    actual: &Ty<N>,
+    bindings: &mut FxHashMap<ParamTy, Ty<N>>,
+) {
     let mut cons = InferenceConstraints::new();
     cons.record_with(formal, actual, InferOpts::COMPILE_TIME);
     merge_best_effort(bindings, &cons);
 }
 
-pub fn infer_bindings_allow_typevars(
-    formal: &Ty,
-    actual: &Ty,
-    bindings: &mut FxHashMap<ParamTy, Ty>,
+pub fn infer_bindings_allow_typevars<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    formal: &Ty<N>,
+    actual: &Ty<N>,
+    bindings: &mut FxHashMap<ParamTy, Ty<N>>,
 ) {
     let mut cons = InferenceConstraints::new();
     cons.record_with(
@@ -626,10 +663,10 @@ pub fn infer_bindings_allow_typevars(
 /// Like [`infer_bindings`] but treats `rigid` (when `Some`) as a rigid type
 /// variable that is never bound from an argument — the pinned `Self` of an
 /// interface method call. Every other variable infers exactly as before.
-pub fn infer_bindings_rigid_self(
-    formal: &Ty,
-    actual: &Ty,
-    bindings: &mut FxHashMap<ParamTy, Ty>,
+pub fn infer_bindings_rigid_self<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    formal: &Ty<N>,
+    actual: &Ty<N>,
+    bindings: &mut FxHashMap<ParamTy, Ty<N>>,
     rigid: Option<&ParamTy>,
 ) {
     let mut cons = InferenceConstraints::new();
@@ -655,7 +692,11 @@ pub fn infer_bindings_rigid_self(
 /// solve one argument at a time. Callers that want the variance-aware reject
 /// (`02d`/`02e`) should accumulate an [`InferenceConstraints`] across all
 /// arguments and call [`InferenceConstraints::solve`].
-pub fn infer_value_bindings(formal: &Ty, actual: &Ty, bindings: &mut FxHashMap<ParamTy, Ty>) {
+pub fn infer_value_bindings<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    formal: &Ty<N>,
+    actual: &Ty<N>,
+    bindings: &mut FxHashMap<ParamTy, Ty<N>>,
+) {
     let mut cons = InferenceConstraints::new();
     cons.record(formal, actual);
     merge_best_effort(bindings, &cons);
@@ -667,13 +708,19 @@ pub fn infer_value_bindings(formal: &Ty, actual: &Ty, bindings: &mut FxHashMap<P
 ///
 /// Used when the same type variable is inferred from multiple arguments
 /// (e.g., `deep_equals(myInt, myString)` → `T` gets `int` then `string`).
-pub fn union_ty(a: &Ty, b: &Ty) -> Ty {
+pub fn union_ty<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    a: &Ty<N>,
+    b: &Ty<N>,
+) -> Ty<N> {
     normalize_union_members([a.clone(), b.clone()], TyAttr::default())
 }
 
 /// Flatten nested unions, drop `Never`, deduplicate; collapse a single survivor
 /// to a bare type and an empty result to `Never`.
-pub fn normalize_union_members(members: impl IntoIterator<Item = Ty>, attr: TyAttr) -> Ty {
+pub fn normalize_union_members<N: Head + baml_type::HeadDisplay + baml_type::HeadFromName>(
+    members: impl IntoIterator<Item = Ty<N>>,
+    attr: TyAttr,
+) -> Ty<N> {
     let mut normalized = Vec::new();
     for member in members {
         match member {

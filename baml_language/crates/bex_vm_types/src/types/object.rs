@@ -127,8 +127,8 @@ pub enum Object {
     /// Collector object (opaque handle to `bex_events::Collector`).
     Collector(CollectorRef),
 
-    /// A type descriptor value — wraps a `baml_type::RealizedTy`.
-    Type(Box<baml_type::RealizedTy>),
+    /// A type descriptor value — wraps a `crate::RealizedTy`.
+    Type(Box<crate::RealizedTy>),
 
     #[cfg(feature = "heap_debug")]
     Sentinel(crate::types::SentinelKind),
@@ -166,6 +166,25 @@ impl Object {
             _ => None,
         }
     }
+
+    /// The tag identifying this object as a declaration, or `None` if it is not
+    /// one.
+    ///
+    /// Exactly four kinds of object can head a nominal type, and this is the one
+    /// place that says which — so a fifth cannot be added without every lookup
+    /// that turns an object into a [`TypeHead`](crate::TypeHead) learning about
+    /// it at once.
+    #[inline]
+    #[must_use]
+    pub fn declared_type_tag(&self) -> Option<baml_type::typetag::TypeTag> {
+        match self {
+            Object::Class(c) => Some(c.type_tag),
+            Object::Enum(e) => Some(e.type_tag),
+            Object::Interface(i) => Some(i.type_tag),
+            Object::TypeAlias(a) => Some(a.type_tag),
+            _ => None,
+        }
+    }
 }
 
 // Custom borsh for Object: RustData and Collector contain non-serializable
@@ -198,10 +217,10 @@ enum ObjectWire {
         num_bigint::BigInt,
     ),
     Uint8Array(Vec<u8>),
-    Array(Box<baml_type::RealizedTy>, Vec<Value>),
+    Array(Box<crate::RealizedTy>, Vec<Value>),
     Map(
-        Box<baml_type::RealizedTy>,
-        Box<baml_type::RealizedTy>,
+        Box<crate::RealizedTy>,
+        Box<crate::RealizedTy>,
         IndexMap<String, Value>,
     ),
     Float(f64),
@@ -212,7 +231,7 @@ enum ObjectWire {
     // enum's size. Borsh treats `Box<T>` transparently, so the wire form is
     // unchanged.
     UnscheduledFuture(Box<UnscheduledFuture>),
-    Type(Box<baml_type::RealizedTy>),
+    Type(Box<crate::RealizedTy>),
 }
 
 impl BorshSerialize for Object {

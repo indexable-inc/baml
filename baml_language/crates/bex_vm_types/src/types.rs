@@ -20,7 +20,6 @@ mod value;
 
 use std::collections::HashMap;
 
-use baml_type::RuntimeTy;
 use borsh::{BorshDeserialize, BorshSerialize};
 pub use class::*;
 pub use const_value::*;
@@ -36,7 +35,7 @@ pub use tokio_util::sync::CancellationToken;
 pub use type_alias::*;
 pub use value::*;
 
-use crate::{heap_ptr::HeapPtr, indexable::ObjectPool};
+use crate::{RuntimeTy, heap_ptr::HeapPtr, indexable::ObjectPool};
 
 // ============================================================================
 // Type Tags for Jump Table Dispatch
@@ -163,7 +162,7 @@ impl Program {
     ///
     /// Aliases are `Object::TypeAlias` declarations, so this dereferences each
     /// through the object pool rather than reading a side map.
-    pub fn recursive_type_aliases(&self) -> IndexMap<baml_type::TypeName, baml_type::RealizedTy> {
+    pub fn recursive_type_aliases(&self) -> IndexMap<baml_type::TypeName, crate::RealizedTy> {
         let mut out = IndexMap::new();
         for (pkg_name, package) in &self.packages {
             for (local, idx) in &package.type_aliases {

@@ -21,6 +21,7 @@ mod roots;
 pub mod task_group;
 pub mod type_head;
 pub mod types;
+pub mod typetag_index;
 pub mod unit;
 
 pub use bex_str::BexStr;
@@ -61,6 +62,14 @@ pub type TyTemplate = baml_type::TyTemplate<TypeHead>;
 /// [`baml_type::RuntimeInterface`] at the runtime's head.
 pub type RuntimeInterface = baml_type::RuntimeInterface<TypeHead>;
 
+// ── Leaving the runtime ─────────────────────────────────────────────────────
+//
+// Only the outbound direction gets helpers, because only it has a decision to
+// share: what to do when a head cannot be named. Inbound is
+// `map_heads(&mut TypeHead::of_name)` written at the construction site — it
+// yields *unresolved* heads, so it is correct only where compile-time data is
+// being built, and wrapping it would invite use where that does not hold.
+
 /// A head that could not be named when converting a type out of the VM.
 ///
 /// Carries the tag rather than a stand-in name: a boundary that cannot say what
@@ -92,6 +101,11 @@ pub fn name_headed(ty: &RuntimeTy) -> Result<baml_type::RuntimeTy, UnnameableHea
 
 /// [`name_headed`] for a realized type.
 pub fn name_headed_realized(ty: &RealizedTy) -> Result<baml_type::RealizedTy, UnnameableHead> {
+    ty.try_map_heads(&mut |head| head.declared_name().ok_or(UnnameableHead(head.tag())))
+}
+
+/// [`name_headed`] for a signature template.
+pub fn name_headed_template(ty: &TyTemplate) -> Result<baml_type::TyTemplate, UnnameableHead> {
     ty.try_map_heads(&mut |head| head.declared_name().ok_or(UnnameableHead(head.tag())))
 }
 pub use types::{

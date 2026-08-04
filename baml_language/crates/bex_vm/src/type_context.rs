@@ -9,9 +9,13 @@
 //! Most methods are wired to real runtime data:
 //! - `implements_interface` → the open-world resolver
 //!   (`ImplResolver::type_implements`) over the per-package `impl_rules`.
-//! - `alias_def` → the VM's recursive type aliases (via the `packages` index).
-//! - `enum_variants` → the `Object::Enum` on the heap (via `vm.lookup_type`, the
-//!   `packages` index).
+//! - `alias_def` → the `Object::TypeAlias` on the heap.
+//! - `enum_variants` → the `Object::Enum` on the heap.
+//!
+//! Both of those reach their declaration through [`BexVm::declaration`] rather
+//! than dereferencing the head they are handed: `head_lookup` below mints
+//! *unresolved* heads (correct — its callers only compare them), and those come
+//! back to these two methods.
 //! - `project` → the resolver's associated-type binding, realized against the
 //!   selected impl.
 //!
@@ -29,30 +33,39 @@
 //! stricter than the compiler where it would break a proven-exhaustive match —
 //! see the List/Map-invariance sequencing constraint).
 
-use baml_type::{
-    Interface, Name, ParamTy, QualifiedTypeName, RealizedTy, Ty, normalize::TypeContext,
-};
-use bex_vm_types::types::Object;
+use baml_type::{Interface, Name, ParamTy, Ty, normalize::TypeContext};
+use bex_vm_types::{RealizedTy, TypeHead, types::Object};
 
 use crate::BexVm;
 
-impl TypeContext for BexVm {
-    /// A name-based context represents a declaration by its own name, so this
-    /// is the identity — no resolution step, and never `None`.
-    fn head_lookup(
-        &self,
-        qtn: &baml_type::QualifiedTypeName,
-    ) -> Option<baml_type::QualifiedTypeName> {
-        Some(qtn.clone())
+impl TypeContext<TypeHead> for BexVm {
+    /// A declared head's tag is content-addressed from its name, so naming one
+    /// needs neither the heap nor a package map.
+    ///
+    /// The head comes back *unresolved*, and that is correct here: this exists
+    /// so callers can recognize a particular declaration with `==`, and equality
+    /// is the tag alone. Resolving the pointer would be work no caller uses.
+    fn head_lookup(&self, qtn: &baml_type::QualifiedTypeName) -> Option<TypeHead> {
+        Some(TypeHead::of_name(qtn))
     }
 
-    fn alias_def(&self, name: &QualifiedTypeName) -> Option<Ty> {
+    fn alias_def(&self, name: &TypeHead) -> Option<Ty<TypeHead>> {
         // Only recursive aliases survive to runtime; non-recursive ones were
-        // expanded inline at lowering. Widen the stored `RuntimeTy` up to `Ty`.
-        self.recursive_type_alias(name).map(Ty::from)
+        // expanded inline at lowering.
+        //
+        // Resolved through `declaration` rather than dereferenced: `head_lookup`
+        // above hands out unresolved heads, and they come back here.
+        match self.get_object(self.declaration(*name)?) {
+            Object::TypeAlias(alias) => Some(Ty::from(&alias.definition)),
+            _ => None,
+        }
     }
 
-    fn implements_interface(&self, concrete: &Ty, interface: &Interface) -> bool {
+    fn implements_interface(
+        &self,
+        concrete: &Ty<TypeHead>,
+        interface: &Interface<TypeHead>,
+    ) -> bool {
         // Narrow the algebra's `Ty` operands to the runtime's `RealizedTy` and
         // delegate to the open-world resolver. A narrowing failure (a non-realized
         // variant such as `TypeVar` — which can be a runtime type as data, but
@@ -84,7 +97,7 @@ impl TypeContext for BexVm {
         )
     }
 
-    fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface> {
+    fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface<TypeHead>> {
         // Runtime subtype queries are always over realized operands: templates are
         // substituted against realized frame args before any comparison, and the
         // resolver narrows to `RealizedTy` — so a `NormalTy::TypeVar` node (the
@@ -108,7 +121,7 @@ impl TypeContext for BexVm {
         Vec::new()
     }
 
-    fn interface_requires(&self, _sub: &Interface, _sup: &Interface) -> bool {
+    fn interface_requires(&self, _sub: &Interface<TypeHead>, _sup: &Interface<TypeHead>) -> bool {
         // TODO(runtime-requires): no `requires`-closure entry exists at runtime
         // yet (the resolver proves `concrete: I`, not `I_a requires I_b`). Fail
         // safe — claim no proper requirement; interface-to-interface subtyping
@@ -117,11 +130,9 @@ impl TypeContext for BexVm {
         false
     }
 
-    fn enum_variants(&self, name: &QualifiedTypeName) -> Option<Vec<Name>> {
-        // Enums live on the heap; look the qualified name up through its package
-        // (classes and enums share one type namespace).
-        let ptr = self.lookup_type(name)?;
-        match self.get_object(ptr) {
+    fn enum_variants(&self, name: &TypeHead) -> Option<Vec<Name>> {
+        // Resolved rather than dereferenced, for the reason in `alias_def`.
+        match self.get_object(self.declaration(*name)?) {
             Object::Enum(en) => Some(
                 en.variants
                     .iter()
@@ -132,7 +143,11 @@ impl TypeContext for BexVm {
         }
     }
 
-    fn associated_type_bound(&self, _interface: &Interface, _assoc: Name) -> Vec<Interface> {
+    fn associated_type_bound(
+        &self,
+        _interface: &Interface<TypeHead>,
+        _assoc: Name,
+    ) -> Vec<Interface<TypeHead>> {
         // Empty, for the same reason as `type_var_bound`: runtime subtype queries
         // are over realized operands, so a still-symbolic `(_ as I).assoc`
         // projection never reaches the subtype rule that would consult this bound —
@@ -149,11 +164,11 @@ impl TypeContext for BexVm {
 
     fn project(
         &self,
-        base: &Ty,
-        interface: &Interface,
+        base: &Ty<TypeHead>,
+        interface: &Interface<TypeHead>,
         member: &Name,
         fuel: u32,
-    ) -> baml_type::normalize::ProjectionStep {
+    ) -> baml_type::normalize::ProjectionStep<TypeHead> {
         use baml_type::normalize::ProjectionStep;
         // Reduce `(base as I).member` to the impl's binding when the base is a
         // realized runtime type — the runtime twin of the compiler's projection
@@ -228,49 +243,54 @@ impl TypeContext for BexVm {
 /// of severed here); until then, opacity is the termination guarantee.
 pub(crate) struct StructuralEquivCtx<'a>(pub(crate) &'a BexVm);
 
-impl TypeContext for StructuralEquivCtx<'_> {
+impl TypeContext<TypeHead> for StructuralEquivCtx<'_> {
     /// A name-based context represents a declaration by its own name, so this
     /// is the identity — no resolution step, and never `None`.
-    fn head_lookup(
-        &self,
-        qtn: &baml_type::QualifiedTypeName,
-    ) -> Option<baml_type::QualifiedTypeName> {
-        Some(qtn.clone())
+    fn head_lookup(&self, qtn: &baml_type::QualifiedTypeName) -> Option<TypeHead> {
+        Some(TypeHead::of_name(qtn))
     }
 
-    fn alias_def(&self, name: &QualifiedTypeName) -> Option<Ty> {
+    fn alias_def(&self, name: &TypeHead) -> Option<Ty<TypeHead>> {
         // Same alias facts as the full context — non-re-entrant, and required
         // for recursive-alias folding.
         self.0.alias_def(name)
     }
 
-    fn implements_interface(&self, _concrete: &Ty, _interface: &Interface) -> bool {
+    fn implements_interface(
+        &self,
+        _concrete: &Ty<TypeHead>,
+        _interface: &Interface<TypeHead>,
+    ) -> bool {
         false // Opaque: re-entrant (→ the resolver), unboundedly.
     }
 
-    fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface> {
+    fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface<TypeHead>> {
         Vec::new()
     }
 
-    fn interface_requires(&self, _sub: &Interface, _sup: &Interface) -> bool {
+    fn interface_requires(&self, _sub: &Interface<TypeHead>, _sup: &Interface<TypeHead>) -> bool {
         false // Opaque.
     }
 
-    fn enum_variants(&self, _name: &QualifiedTypeName) -> Option<Vec<Name>> {
+    fn enum_variants(&self, _name: &TypeHead) -> Option<Vec<Name>> {
         None // Opaque.
     }
 
-    fn associated_type_bound(&self, _interface: &Interface, _assoc: Name) -> Vec<Interface> {
+    fn associated_type_bound(
+        &self,
+        _interface: &Interface<TypeHead>,
+        _assoc: Name,
+    ) -> Vec<Interface<TypeHead>> {
         Vec::new()
     }
 
     fn project(
         &self,
-        _base: &Ty,
-        _interface: &Interface,
+        _base: &Ty<TypeHead>,
+        _interface: &Interface<TypeHead>,
         _member: &Name,
         _fuel: u32,
-    ) -> baml_type::normalize::ProjectionStep {
+    ) -> baml_type::normalize::ProjectionStep<TypeHead> {
         baml_type::normalize::ProjectionStep::Opaque // Opaque: re-entrant (→ the resolver).
     }
 }

@@ -68,7 +68,7 @@ fn convert_toml_value(vm: &mut BexVm, value: ::toml::Value) -> Result<Value, VmR
             // TOML table values decode into the `json` algebra (string keys),
             // so the value type is the recursive `json` union.
             let map = Value::object(vm.alloc_map(
-                baml_type::RealizedTy::string(),
+                bex_vm_types::RealizedTy::string(),
                 super::json::json_alias_ty(),
                 map,
             ));

@@ -281,6 +281,20 @@ impl WeakHeapRef for BexHeap {
     }
 }
 
+impl bex_vm_types::typetag_index::CompileTimePool for BexHeap {
+    fn compile_time_len(&self) -> usize {
+        self.compile_time_len()
+    }
+
+    fn compile_time_object(&self, slot: usize) -> &Object {
+        self.compile_time_object(slot)
+    }
+
+    fn compile_time_ptr(&self, slot: usize) -> bex_vm_types::HeapPtr {
+        self.compile_time_ptr(slot)
+    }
+}
+
 impl BexHeap {
     /// Create a new heap with compile-time objects.
     ///
@@ -389,6 +403,17 @@ impl BexHeap {
     /// Panics if `index` is out of bounds.
     pub fn set_compile_time_object(&mut self, index: usize, object: Object) {
         self.compile_time[index] = object;
+    }
+
+    /// Mutable access to a compile-time object, for the load-time passes that
+    /// rewrite objects in place (see `package_load::resolve_type_heads`).
+    pub fn compile_time_object_mut(&mut self, index: usize) -> &mut Object {
+        &mut self.compile_time[index]
+    }
+
+    /// Shared access to a compile-time object.
+    pub fn compile_time_object(&self, index: usize) -> &Object {
+        &self.compile_time[index]
     }
 
     /// Resolve bytecode constants for all Function objects.

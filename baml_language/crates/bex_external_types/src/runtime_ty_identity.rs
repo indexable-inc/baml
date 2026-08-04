@@ -2,7 +2,10 @@ use baml_type::RuntimeTy;
 
 /// Exact semantic identity for runtime types, ignoring source-only attributes
 /// and union member ordering.
-pub fn runtime_ty_structurally_equal(left: &RuntimeTy, right: &RuntimeTy) -> bool {
+pub fn runtime_ty_structurally_equal<N: PartialEq + Clone>(
+    left: &RuntimeTy<N>,
+    right: &RuntimeTy<N>,
+) -> bool {
     use RuntimeTy as T;
     match (left, right) {
         (T::String { .. }, T::String { .. })
@@ -74,7 +77,10 @@ pub fn runtime_ty_structurally_equal(left: &RuntimeTy, right: &RuntimeTy) -> boo
     }
 }
 
-fn structurally_equal_slices(left: &[RuntimeTy], right: &[RuntimeTy]) -> bool {
+fn structurally_equal_slices<N: PartialEq + Clone>(
+    left: &[RuntimeTy<N>],
+    right: &[RuntimeTy<N>],
+) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -82,7 +88,10 @@ fn structurally_equal_slices(left: &[RuntimeTy], right: &[RuntimeTy]) -> bool {
             .all(|(left, right)| runtime_ty_structurally_equal(left, right))
 }
 
-fn structurally_equal_unordered_slices(left: &[RuntimeTy], right: &[RuntimeTy]) -> bool {
+fn structurally_equal_unordered_slices<N: PartialEq + Clone>(
+    left: &[RuntimeTy<N>],
+    right: &[RuntimeTy<N>],
+) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -101,7 +110,7 @@ fn structurally_equal_unordered_slices(left: &[RuntimeTy], right: &[RuntimeTy]) 
 
 /// Compare a selected union arm while tolerating the legacy root-level
 /// representation where a non-null arm may be wrapped in `T | null`.
-pub fn selected_arm_equal(left: &RuntimeTy, right: &RuntimeTy) -> bool {
+pub fn selected_arm_equal<N: PartialEq + Clone>(left: &RuntimeTy<N>, right: &RuntimeTy<N>) -> bool {
     if runtime_ty_structurally_equal(left, right) {
         return true;
     }
@@ -109,7 +118,7 @@ pub fn selected_arm_equal(left: &RuntimeTy, right: &RuntimeTy) -> bool {
         || sole_non_null(right).is_some_and(|inner| runtime_ty_structurally_equal(left, inner))
 }
 
-fn sole_non_null(ty: &RuntimeTy) -> Option<&RuntimeTy> {
+fn sole_non_null<N: PartialEq + Clone>(ty: &RuntimeTy<N>) -> Option<&RuntimeTy<N>> {
     let RuntimeTy::Union(members, _) = ty else {
         return None;
     };

@@ -9,8 +9,9 @@
 //! it demands. (`reflect.type_of` is a compiler intrinsic, so it never reaches
 //! a native at all.)
 
-use baml_type::{RealizedTy, Ty, TyAttr, normalize};
+use baml_type::{TyAttr, normalize};
 use bex_heap::TlabHolder;
+use bex_vm_types::RealizedTy;
 // `Instance`/`Type`/the read guards are referenced by the generated module.
 use bex_vm_types::{
     ArrayReadGuard, MapReadGuard,
@@ -92,7 +93,8 @@ fn non_callable_error(what: &str) -> VmRustFnError {
 /// The `reflect.Arg` class type, for array/map element tags.
 fn ty_arg() -> RealizedTy {
     RealizedTy::Class(
-        baml_type::QualifiedTypeName::from_dotted_path(ARG_FQN),
+        // Unresolved: used for comparison and tagging, where identity is the tag.
+        bex_vm_types::TypeHead::of_name(&baml_type::QualifiedTypeName::from_dotted_path(ARG_FQN)),
         vec![],
         TyAttr::default(),
     )
@@ -218,8 +220,8 @@ fn value_fits(vm: &BexVm, value: Value, expected: &RealizedTy) -> bool {
     // No convention patching is needed on the way in: a reconstructed
     // signature spells "cannot throw" as `never`, exactly as the static
     // algebra does.
-    let actual: Ty = actual.into();
-    let expected: Ty = expected.clone().into();
+    let actual: baml_type::Ty<bex_vm_types::TypeHead> = actual.into();
+    let expected: baml_type::Ty<bex_vm_types::TypeHead> = expected.clone().into();
     // The VM itself is the runtime `TypeContext`.
     normalize::is_subtype(&actual, &expected, vm)
 }

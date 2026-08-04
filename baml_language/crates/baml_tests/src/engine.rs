@@ -91,7 +91,8 @@ pub fn display_user_functions_with_options(program: &Program, show_auto_derive: 
         })
         .collect();
     functions.sort_by(|(a, _), (b, _)| a.cmp(b));
-    display_program(&functions, BytecodeFormat::Textual)
+    let heads = bex_vm::debug::HeadNames::of(program);
+    display_program(&functions, BytecodeFormat::Textual, &heads)
 }
 
 /// Resolve a user-provided entry name to the fully-qualified name used in the program.

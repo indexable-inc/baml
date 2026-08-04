@@ -25,7 +25,7 @@
 //!
 //! ```
 
-use std::fmt::Write;
+use std::{collections::HashMap, fmt::Write};
 
 use bex_vm_types::{
     ConstValue, HeapPtr,
@@ -994,6 +994,63 @@ fn display_instruction_textual(
     }
 }
 
+/// What a compiled program's type heads are called.
+///
+/// A `Program` that has not been loaded has no heap, so its
+/// [`TypeHead`](bex_vm_types::TypeHead)s are unresolved: they carry the right
+/// identity but no pointer, and so cannot name themselves. Every declaration in
+/// the pool carries both its `TypeName` and the `type_tag` heads are keyed by,
+/// which makes the pool its own lookup table — that is what this builds.
+///
+/// Anything that renders or inspects a pre-load `Program`'s types goes through
+/// here. Rendering such a type directly yields `<unresolved type #N>`, which is
+/// honest but useless.
+#[derive(Debug, Clone, Default)]
+pub struct HeadNames(HashMap<baml_type::typetag::TypeTag, baml_type::TypeName>);
+
+impl HeadNames {
+    /// Index every declaration `program` pools.
+    #[must_use]
+    pub fn of(program: &bex_vm_types::types::Program) -> Self {
+        Self(
+            program
+                .objects
+                .iter()
+                .filter_map(|object| match object {
+                    Object::Class(c) => Some((c.type_tag, c.name.clone())),
+                    Object::Enum(e) => Some((e.type_tag, e.name.clone())),
+                    Object::Interface(i) => Some((i.type_tag, i.name.clone())),
+                    Object::TypeAlias(a) => Some((a.type_tag, a.name.clone())),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    /// What one head is called. A head no pooled declaration claims keeps its
+    /// tag, which is all that is left to say about it.
+    fn name(&self, head: &bex_vm_types::TypeHead) -> baml_type::TypeName {
+        self.0.get(&head.tag()).cloned().unwrap_or_else(|| {
+            baml_type::TypeName::local(baml_type::Name::new(format!(
+                "<type #{}>",
+                head.tag().as_i64()
+            )))
+        })
+    }
+
+    /// Re-anchor a signature template onto names.
+    #[must_use]
+    pub fn template(&self, ty: &bex_vm_types::TyTemplate) -> baml_type::TyTemplate {
+        ty.map_heads(&mut |head| self.name(head))
+    }
+
+    /// Re-anchor a realized type onto names.
+    #[must_use]
+    pub fn realized(&self, ty: &bex_vm_types::RealizedTy) -> baml_type::RealizedTy {
+        ty.map_heads(&mut |head| self.name(head))
+    }
+}
+
 /// Display a full program in the specified format.
 ///
 /// [`BytecodeFormat::Textual`] produces human-readable assembly with labels
@@ -1010,7 +1067,11 @@ fn display_instruction_textual(
 ///
 /// [`BytecodeFormat::Expanded`] shows raw bytecode addresses, source lines,
 /// raw operand indices, and metadata annotations.
-pub fn display_program(functions: &[(String, &Function)], format: BytecodeFormat) -> String {
+pub fn display_program(
+    functions: &[(String, &Function)],
+    format: BytecodeFormat,
+    heads: &HeadNames,
+) -> String {
     let mut output = String::new();
 
     for (i, (name, func)) in functions.iter().enumerate() {
@@ -1023,13 +1084,13 @@ pub fn display_program(functions: &[(String, &Function)], format: BytecodeFormat
             .param_names
             .iter()
             .zip(func.param_types.iter())
-            .map(|(name, ty)| format!("{name}: {ty}"))
+            .map(|(name, ty)| format!("{name}: {}", heads.template(ty)))
             .collect::<Vec<_>>()
             .join(", ");
         let _ = writeln!(
             output,
             "function {name}({params}) -> {} {{",
-            func.return_type
+            heads.template(&func.return_type)
         );
 
         let body = match format {

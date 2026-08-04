@@ -19,10 +19,10 @@ use std::{
     sync::Arc,
 };
 
-use baml_type::{Name, RealizedTy, TyAttr, TypeName, normalize::TypeContext};
+use baml_type::{Name, TyAttr, TypeName, normalize::TypeContext};
 use bex_str::BexStr;
 use bex_vm_types::{
-    HeapPtr, ValueKind,
+    HeapPtr, RealizedTy, ValueKind,
     errors::VmInternalError,
     types::{LockedContainer, LockedReadGuard, Object, Type, Value},
 };
@@ -216,7 +216,16 @@ fn dispatch_op(
     args: Vec<Value>,
     iface_args: &[RealizedTy],
 ) -> NativeCallResult {
-    let op_qtn = TypeName::new(Name::new("baml"), vec![Name::new("ops")], Name::new(iface));
+    // A literal FQN is a name, so it resolves through the package — the one
+    // place names map to declarations at runtime. An interface the program does
+    // not declare is a miss here rather than a head that matches no impl rule.
+    let Some(op_qtn) = vm.interface_head(&TypeName::new(
+        Name::new("baml"),
+        vec![Name::new("ops")],
+        Name::new(iface),
+    )) else {
+        return NativeCallResult::from(unresolved_op(iface, method));
+    };
     let Some(self_ty) = vm.value_concrete_ty(args[0]) else {
         return NativeCallResult::from(unresolved_op(iface, method));
     };
@@ -669,7 +678,7 @@ fn value_concrete_ty(vm: &BexVm, ptr: HeapPtr) -> Option<RealizedTy> {
             let (class_ptr, type_args) = (inst.class, inst.class_type_args.to_vec());
             match vm.get_object(class_ptr) {
                 Object::Class(class) => Some(RealizedTy::Class(
-                    class.name.clone(),
+                    bex_vm_types::TypeHead::new(class_ptr, class.type_tag),
                     type_args,
                     TyAttr::default(),
                 )),
@@ -677,7 +686,10 @@ fn value_concrete_ty(vm: &BexVm, ptr: HeapPtr) -> Option<RealizedTy> {
             }
         }
         Object::Variant(v) => match vm.get_object(v.enm) {
-            Object::Enum(e) => Some(RealizedTy::Enum(e.name.clone(), TyAttr::default())),
+            Object::Enum(e) => Some(RealizedTy::Enum(
+                bex_vm_types::TypeHead::new(v.enm, e.type_tag),
+                TyAttr::default(),
+            )),
             _ => None,
         },
         _ => None,
@@ -692,8 +704,9 @@ fn resolve_equals_eq(vm: &BexVm, concrete: &RealizedTy) -> Option<(HeapPtr, Vec<
     // `Equals` is non-generic — no interface args to select on; off the resolved
     // rule, `eq` is the concrete method (the impl's own, or the merged default),
     // invoked with its frame realized against the impl's bound type args.
+    let equals = equals_head(vm)?;
     let resolver = resolve::ImplResolver::new(vm);
-    let (rule, bound_args) = resolver.resolve_implements_rule(concrete, &equals_qtn(), &[])?;
+    let (rule, bound_args) = resolver.resolve_implements_rule(concrete, &equals, &[])?;
     let method = rule.methods.get("eq")?;
     // `fqn` is the resolved callee's heap pointer (the impl method or merged
     // default), baked at emit time — invoke it directly.
@@ -710,11 +723,12 @@ fn resolve_equals_eq(vm: &BexVm, concrete: &RealizedTy) -> Option<(HeapPtr, Vec<
     Some((callee, type_args))
 }
 
-/// The `baml.ops.Equals` interface name.
-fn equals_qtn() -> TypeName {
-    TypeName::new(
+/// The `baml.ops.Equals` interface, looked up by name through the package.
+/// `None` if the program does not declare it.
+fn equals_head(vm: &BexVm) -> Option<bex_vm_types::TypeHead> {
+    vm.interface_head(&TypeName::new(
         Name::new("baml"),
         vec![Name::new("ops")],
         Name::new("Equals"),
-    )
+    ))
 }

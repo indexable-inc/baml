@@ -29,6 +29,21 @@ pub enum AccessError {
 
     #[error("Cannot convert to owned: {reason}")]
     CannotConvertToOwned { reason: String },
+
+    /// A type leaving the VM carried a head that names no loaded declaration.
+    ///
+    /// The host boundary is name-headed — a [`TypeHead`](bex_vm_types::TypeHead)
+    /// is a pointer into this process's heap and means nothing outside it — so a
+    /// head that cannot be named has no host-facing spelling. Reported rather
+    /// than papered over: handing back a type that looks real and denotes
+    /// nothing is worse than failing here.
+    ///
+    /// Constructed explicitly rather than via `#[from]`: an extra `From` impl on
+    /// this error makes every `?` in an `AccessError`-returning function
+    /// ambiguous when its own error type is not pinned, which the generated
+    /// sys-op accessors rely on.
+    #[error("{0}")]
+    UnnameableHead(bex_vm_types::UnnameableHead),
 }
 
 pub enum BexValue<'a> {
@@ -323,8 +338,11 @@ impl<'a> BexValue<'a> {
                     actual: obj.to_string(),
                 });
             };
-            // `Object::Type` stores a realized type; widen it into `RuntimeTy`.
-            Ok((**ty).clone().into())
+            // `Object::Type` stores a realized type at the runtime's head; name
+            // it for the host boundary, then widen into `RuntimeTy`.
+            Ok(bex_vm_types::name_headed_realized(ty)
+                .map_err(AccessError::UnnameableHead)?
+                .into())
         }
 
         match self {
@@ -419,7 +437,7 @@ fn owned_inner(
                 items: items
                     .iter()
                     .map(|item| owned_inner(BexValue::ExternalValue(item), heap, lossy))
-                    .collect::<Result<_, _>>()?,
+                    .collect::<Result<_, AccessError>>()?,
             }),
             BexExternalValue::Map {
                 key_type,
@@ -436,7 +454,7 @@ fn owned_inner(
                             owned_inner(BexValue::ExternalValue(v), heap, lossy)?,
                         ))
                     })
-                    .collect::<Result<_, _>>()?,
+                    .collect::<Result<_, AccessError>>()?,
             }),
             BexExternalValue::Instance {
                 class_name,
@@ -453,7 +471,7 @@ fn owned_inner(
                             owned_inner(BexValue::ExternalValue(v), heap, lossy)?,
                         ))
                     })
-                    .collect::<Result<_, _>>()?,
+                    .collect::<Result<_, AccessError>>()?,
             }),
             BexExternalValue::Variant {
                 enum_name,
@@ -538,7 +556,7 @@ fn convert_object(
                 .to_vec()
                 .into_iter()
                 .map(|item| owned_inner(BexValue::OwnedValue(item), heap, lossy))
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<_, AccessError>>()?,
         }),
         Object::Map(map) => Ok(BexExternalValue::Map {
             key_type: RuntimeTy::String {
@@ -556,7 +574,7 @@ fn convert_object(
                         owned_inner(BexValue::OwnedValue(v), heap, lossy)?,
                     ))
                 })
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<_, AccessError>>()?,
         }),
         Object::Instance(instance) => {
             let class_obj = unsafe { instance.class.get() };
@@ -576,16 +594,20 @@ fn convert_object(
                         owned_inner(BexValue::OwnedValue(slot.load()), heap, lossy)?,
                     ))
                 })
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<_, AccessError>>()?;
             Ok(BexExternalValue::Instance {
                 class_name: class.name.to_string(),
-                // Instances store realized class type args; widen them into the
-                // `RuntimeTy` the external boundary carries.
+                // Instances store realized class type args at the runtime's
+                // head; name them, then widen into the `RuntimeTy` the external
+                // boundary carries.
                 type_args: instance
                     .class_type_args
                     .iter()
-                    .map(baml_type::RuntimeTy::from)
-                    .collect(),
+                    .map(|arg| {
+                        bex_vm_types::name_headed_realized(arg).map(baml_type::RuntimeTy::from)
+                    })
+                    .collect::<Result<Vec<_>, bex_vm_types::UnnameableHead>>()
+                    .map_err(AccessError::UnnameableHead)?,
                 fields,
             })
         }
@@ -611,7 +633,9 @@ fn convert_object(
         }
         Object::Collector(c) => Ok(BexExternalValue::Adt(BexExternalAdt::Collector(c.clone()))),
         Object::Type(ty) => Ok(BexExternalValue::Adt(BexExternalAdt::Type(
-            (**ty).clone().into(),
+            bex_vm_types::name_headed_realized(ty)
+                .map_err(AccessError::UnnameableHead)?
+                .into(),
         ))),
         Object::Bigint(bi) => Ok(BexExternalValue::Bigint((**bi).clone())),
         Object::Uint8Array(bytes) => Ok(BexExternalValue::Uint8Array(bytes.to_vec())),

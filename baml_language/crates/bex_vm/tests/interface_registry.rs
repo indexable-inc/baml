@@ -7,18 +7,26 @@
 //! winning over the default.
 
 use baml_project::testing::compile_source;
-use baml_type::TyTemplate;
 use bex_vm_types::{Object, types::Program};
 
 /// The head type name of a for-type pattern (`Dog` for `Dog`, `Wrap` for
 /// `Wrap<T>`). Matching on this — rather than a substring of the rendered
 /// pattern — keeps distinct names like `Dog` and `HotDog` (and `$stream`
 /// companions, which have a distinct head name) from colliding.
-fn for_ty_head_name(pat: &TyTemplate) -> Option<&str> {
-    match pat {
-        TyTemplate::Class(qtn, ..) | TyTemplate::Enum(qtn, ..) => Some(qtn.name().as_str()),
+fn for_ty_head_name(program: &Program, pat: &bex_vm_types::TyTemplate) -> Option<String> {
+    let (bex_vm_types::TyTemplate::Class(head, ..) | bex_vm_types::TyTemplate::Enum(head, ..)) =
+        pat
+    else {
+        return None;
+    };
+    // A compiled `Program` has no heap, so its heads are unresolved and cannot
+    // name themselves. The pool is the lookup: every declaration carries both
+    // its `TypeName` and the `type_tag` a head is keyed by.
+    program.objects.iter().find_map(|object| match object {
+        Object::Class(c) if c.type_tag == head.tag() => Some(c.name.name().to_string()),
+        Object::Enum(e) if e.type_tag == head.tag() => Some(e.name.name().to_string()),
         _ => None,
-    }
+    })
 }
 
 /// The `(method name, fn FQN)` pairs recorded for `<for_type> implements <iface>`.
@@ -37,7 +45,7 @@ fn impl_methods(program: &Program, iface: &str, for_type: &str) -> Vec<(String, 
                 .as_interface()
                 .is_some_and(|def| def.name.name().as_str() == iface)
         })
-        .find(|rule| for_ty_head_name(&rule.for_ty_pattern) == Some(for_type))
+        .find(|rule| for_ty_head_name(program, &rule.for_ty_pattern).as_deref() == Some(for_type))
         .unwrap_or_else(|| panic!("no `{for_type} implements {iface}` rule baked"));
     rule.methods
         .iter()

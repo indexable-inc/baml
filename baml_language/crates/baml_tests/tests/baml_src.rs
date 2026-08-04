@@ -138,9 +138,11 @@ fn bytecode() {
             .push((display_name, &**func));
     }
 
+    // A compiled `Program` has no heap, so its heads cannot name themselves.
+    let heads = bex_vm::debug::HeadNames::of(&program);
     for (key, mut funcs) in by_namespace {
         funcs.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let output = display_program(&funcs, BytecodeFormat::Textual);
+        let output = display_program(&funcs, BytecodeFormat::Textual, &heads);
         insta::with_settings!({
             snapshot_path => SNAPSHOT_PATH,
             omit_expression => true,

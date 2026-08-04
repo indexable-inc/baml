@@ -114,7 +114,10 @@ fn thrown_parameter_named_like_a_catch_binding_is_not_a_rethrow() {
     let Some(bex_vm_types::Object::Function(func)) = program.objects.get(idx) else {
         panic!("user.f should resolve to a function object");
     };
-    let throws = format!("{:?}", func.throws_type);
+    // Named through the pool: an unloaded program's heads render as bare tags.
+    let throws = bex_vm::debug::HeadNames::of(&program)
+        .template(&func.throws_type)
+        .to_string();
     assert!(
         throws.contains("MyError"),
         "f throws its `MyError` parameter outside the catch arm, but the throws \

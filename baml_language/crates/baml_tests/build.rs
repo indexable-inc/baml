@@ -984,9 +984,13 @@ fn generate_codegen_test(
                 })
                 .collect();
 
+            // A compiled `Program` has no heap, so its heads cannot name
+            // themselves; the pool supplies the names.
+            let heads = bex_vm::debug::HeadNames::of(&program);
             let output = bex_vm::debug::display_program(
                 &functions,
                 bex_vm::debug::BytecodeFormat::Textual,
+                &heads,
             );
 
             with_settings!({snapshot_path => SNAPSHOT_PATH, omit_expression => true}, {

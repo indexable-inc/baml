@@ -993,7 +993,7 @@ fn host_call_type_arg(
     ty_arg: Option<Value>,
     slot_index: usize,
     slot_name: &'static str,
-) -> Result<baml_type::RuntimeTy, bex_vm::errors::VmInternalError> {
+) -> Result<bex_vm_types::RuntimeTy, bex_vm::errors::VmInternalError> {
     let bad_slot = || bex_vm::errors::VmInternalError::BridgeFailure {
         message: format!(
             "call_host_value: missing or non-Type {slot_name} (sysop arg slot \
@@ -1012,7 +1012,7 @@ fn host_call_type_arg(
     // pointer would dangle. The caller clones the `RuntimeTy` out before awaiting.
     match unsafe { ptr.get() } {
         // `Object::Type` stores a realized type; widen it to the boundary `RuntimeTy`.
-        Object::Type(ty) => Ok((**ty).clone().into()),
+        Object::Type(ty) => Ok(bex_vm_types::RuntimeTy::from((**ty).clone())),
         _ => Err(bad_slot()),
     }
 }
@@ -1023,7 +1023,10 @@ fn host_call_type_arg(
 /// must become `BexExternalValue::Union` before the shared wire encoder runs.
 fn host_call_params(
     handle: Option<Value>,
-) -> Result<Vec<baml_type::RealizedFunctionParamTy>, bex_vm::errors::VmInternalError> {
+) -> Result<
+    Vec<baml_type::RealizedFunctionParamTy<bex_vm_types::TypeHead>>,
+    bex_vm::errors::VmInternalError,
+> {
     let malformed = || bex_vm::errors::VmInternalError::BridgeFailure {
         message: "call_host_value: missing or non-HostClosure handle in sysop arg slot 0"
             .to_string(),
@@ -1106,27 +1109,29 @@ struct SpawnParamsData {
 fn enforce_host_throw_contract(
     thread: &mut ActiveHeapPermit<BexThread>,
     value: Value,
-    contract: &RuntimeTy,
+    contract: &bex_vm_types::RuntimeTy,
 ) -> Value {
     // `BuiltinUnknown` is the top type — short-circuit before any heap
     // walking.
-    if matches!(contract, RuntimeTy::BuiltinUnknown { .. }) {
+    if matches!(contract, bex_vm_types::RuntimeTy::BuiltinUnknown { .. }) {
         return value;
     }
     let runtime_ty = value_runtime_baml_ty(value, thread.proof());
     // Panics propagate as panics regardless of `E` — they're an
     // engine-level failure mode, not something the user's callable opts
     // into via `throws`.
-    if let Some(RuntimeTy::Class(name, _, _)) = runtime_ty.as_ref()
+    if let Some(bex_vm_types::RuntimeTy::Class(name, _, _)) = runtime_ty.as_ref()
         && name.is_panic_type()
     {
         return value;
     }
-    let on_contract = runtime_ty.as_ref().is_some_and(|rt: &RuntimeTy| {
-        // The VM is the runtime `TypeContext`; operands upcast to `Ty` by a
-        // zero-cost borrow.
-        baml_type::normalize::is_subtype(rt.as_ty(), contract.as_ty(), &thread.vm)
-    });
+    let on_contract = runtime_ty
+        .as_ref()
+        .is_some_and(|rt: &bex_vm_types::RuntimeTy| {
+            // The VM is the runtime `TypeContext`; operands upcast to `Ty` by a
+            // zero-cost borrow.
+            baml_type::normalize::is_subtype(rt.as_ty(), contract.as_ty(), &thread.vm)
+        });
     if on_contract {
         return value;
     }
@@ -1158,18 +1163,21 @@ fn enforce_host_throw_contract(
 ///
 /// `_proof` ensures the caller holds an active heap permit so the
 /// `HeapPtr` derefs in this function are sound.
-fn value_runtime_baml_ty(value: Value, _proof: bex_heap::PermitProof<'_>) -> Option<RuntimeTy> {
+fn value_runtime_baml_ty(
+    value: Value,
+    _proof: bex_heap::PermitProof<'_>,
+) -> Option<bex_vm_types::RuntimeTy> {
     use baml_type::TyAttr;
     use bex_vm_types::ValueKind;
     match value.kind() {
         ValueKind::OmittedArg => None,
-        ValueKind::Null => Some(RuntimeTy::Null {
+        ValueKind::Null => Some(bex_vm_types::RuntimeTy::Null {
             attr: TyAttr::default(),
         }),
-        ValueKind::Int(_) => Some(RuntimeTy::Int {
+        ValueKind::Int(_) => Some(bex_vm_types::RuntimeTy::Int {
             attr: TyAttr::default(),
         }),
-        ValueKind::Bool(_) => Some(RuntimeTy::Bool {
+        ValueKind::Bool(_) => Some(bex_vm_types::RuntimeTy::Bool {
             attr: TyAttr::default(),
         }),
         ValueKind::Object(ptr) => {
@@ -1183,20 +1191,22 @@ fn value_runtime_baml_ty(value: Value, _proof: bex_heap::PermitProof<'_>) -> Opt
                     let Object::Class(class) = class_obj else {
                         return None;
                     };
-                    Some(RuntimeTy::Class(
-                        class.name.clone(),
+                    // The declaration is in hand, so its head is the pointer
+                    // paired with the tag it carries.
+                    Some(bex_vm_types::RuntimeTy::Class(
+                        bex_vm_types::TypeHead::new(instance.class, class.type_tag),
                         instance
                             .class_type_args
                             .iter()
-                            .map(baml_type::RuntimeTy::from)
+                            .map(bex_vm_types::RuntimeTy::from)
                             .collect(),
                         TyAttr::default(),
                     ))
                 }
-                Object::String(_) => Some(RuntimeTy::String {
+                Object::String(_) => Some(bex_vm_types::RuntimeTy::String {
                     attr: TyAttr::default(),
                 }),
-                Object::Float(_) => Some(RuntimeTy::Float {
+                Object::Float(_) => Some(bex_vm_types::RuntimeTy::Float {
                     attr: TyAttr::default(),
                 }),
                 Object::Variant(variant) => {
@@ -1206,7 +1216,10 @@ fn value_runtime_baml_ty(value: Value, _proof: bex_heap::PermitProof<'_>) -> Opt
                     let Object::Enum(enum_def) = enum_obj else {
                         return None;
                     };
-                    Some(RuntimeTy::Enum(enum_def.name.clone(), TyAttr::default()))
+                    Some(bex_vm_types::RuntimeTy::Enum(
+                        bex_vm_types::TypeHead::new(variant.enm, enum_def.type_tag),
+                        TyAttr::default(),
+                    ))
                 }
                 // Other Object shapes (HostClosure, FunctionRef, Array,
                 // Map, etc.) are not meaningful in a thrown position;
@@ -1315,15 +1328,26 @@ fn derive_lambda_metadata(fqn: &str) -> (Option<bex_events::DefinitionKey>, Opti
 /// which keys on type-variable *names*. Substituting an empty frame instead
 /// would collapse every slot to `unknown` and erase exactly what that inference
 /// reads — turning "infer `T` from the argument" into "there is no `T`".
-fn declared_symbolic(template: &baml_type::TyTemplate, func: &bex_vm_types::Function) -> RuntimeTy {
+/// [`declared_symbolic`] named for a host-facing sink. A loaded function's
+/// declared types have resolved heads, so this cannot fail.
+fn name_declared(template: &bex_vm_types::TyTemplate, func: &bex_vm_types::Function) -> RuntimeTy {
+    let ty = declared_symbolic(template, func);
+    bex_vm_types::name_headed(&ty)
+        .unwrap_or_else(|e| unreachable!("loaded function signature carries {e}"))
+}
+
+fn declared_symbolic(
+    template: &bex_vm_types::TyTemplate,
+    func: &bex_vm_types::Function,
+) -> bex_vm_types::RuntimeTy {
     // `display_type_params` is De Bruijn ordered, so a param's position *is* its
     // frame slot — the index a `ParamTy` identity carries.
-    let slot_vars: Vec<RuntimeTy> = func
+    let slot_vars: Vec<bex_vm_types::RuntimeTy> = func
         .display_type_params
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            RuntimeTy::TypeVar(
+            bex_vm_types::RuntimeTy::TypeVar(
                 baml_type::ParamTy::new(
                     u32::try_from(i).unwrap_or(u32::MAX),
                     baml_type::Name::new(p.split_whitespace().next().unwrap_or(p)),
@@ -1801,9 +1825,15 @@ impl BexEngine {
             class_definitions: Arc::new(class_definitions),
             enum_definitions: Arc::new(enum_definitions),
             type_alias_definitions: Arc::new(
+                // Host-facing definitions: loaded aliases have resolved heads,
+                // so naming them cannot fail.
                 bex_vm::package_load::all_recursive_type_aliases(&packages)
                     .into_iter()
-                    .map(|(name, ty)| (name, baml_type::RuntimeTy::from(ty)))
+                    .map(|(name, ty)| {
+                        let named = bex_vm_types::name_headed_realized(&ty)
+                            .unwrap_or_else(|e| unreachable!("loaded type alias carries {e}"));
+                        (name, baml_type::RuntimeTy::from(named))
+                    })
                     .collect(),
             ),
             runtime_io,
@@ -2039,7 +2069,7 @@ impl BexEngine {
                         sys_types::LlmFunctionInfo {
                             prompt_template: prompt_template.clone(),
                             client_name: client.clone(),
-                            return_type: declared_symbolic(&func.return_type, func),
+                            return_type: name_declared(&func.return_type, func),
                         },
                     );
                 }
@@ -2068,7 +2098,12 @@ impl BexEngine {
                             .iter()
                             .map(|f| sys_types::ClassFieldDefinition {
                                 name: f.name.clone(),
-                                field_type: f.field_type.clone(),
+                                // Host-facing class definition: a loaded class's
+                                // field types have resolved heads.
+                                field_type: bex_vm_types::name_headed(&f.field_type)
+                                    .unwrap_or_else(|e| {
+                                        unreachable!("loaded class field carries {e}")
+                                    }),
                                 description: f.description.clone(),
                                 alias: f.alias.clone(),
                                 skip: f.skip,
@@ -2600,17 +2635,27 @@ impl BexEngine {
             });
         }
         self.validate_bound_args(function_name, &args)?;
-        let mut return_type = self
-            .function_return_type(function_name)
-            .unwrap_or(RuntimeTy::Null {
-                attr: baml_type::TyAttr::default(),
-            });
-        let throws_type = self.function_throws_type(function_name);
+        // Anchored alongside `declared_param_types`: this whole call path reasons
+        // in head space and only converts back at the host hop.
+        let mut return_type: bex_vm_types::RuntimeTy =
+            self.function_return_type(function_name).map_or_else(
+                || bex_vm_types::RuntimeTy::Null {
+                    attr: baml_type::TyAttr::default(),
+                },
+                |ty| self.anchor_host_ty(&ty),
+            );
+        let throws_type = self
+            .function_throws_type(function_name)
+            .map(|ty| self.anchor_host_ty(&ty));
 
         // Declared parameter types (TypeVars unsubstituted).
         let params = self.function_params(function_name)?;
-        let declared_param_types: Vec<RuntimeTy> =
-            params.iter().map(|(_, ty, _)| (*ty).clone()).collect();
+        // Anchored at the boundary: everything downstream (classification,
+        // coercion, conversion) works in head space.
+        let declared_param_types: Vec<bex_vm_types::RuntimeTy> = params
+            .iter()
+            .map(|(_, ty, _)| self.anchor_host_ty(ty))
+            .collect();
 
         // `type_args` is the unified `TypeVar -> concrete` binding map for a
         // generic call (01pt3). It already holds the host's explicit `_types=`
@@ -2631,14 +2676,19 @@ impl BexEngine {
         // Gate B is lenient about its missing wire args. Captured before the
         // self-receiver / inference sources mutate `type_args`.
         let caller_specified_types = !type_args.is_empty();
-        let mut type_args = type_args;
+        // The host supplies these name-headed; anchor once, since every consumer
+        // below (inference, substitution, the gates) works in head space.
+        let mut type_args: indexmap::IndexMap<String, bex_vm_types::RuntimeTy> = type_args
+            .into_iter()
+            .map(|(name, ty)| (name, self.anchor_host_ty(&ty)))
+            .collect();
         if let (Some(self_declared), Some(BexCallArg::Provided(self_value))) =
             (declared_param_types.first(), args.first())
         {
             if let Some(self_actual) = crate::conversion::tagged_handle_runtime_ty(self_value) {
                 crate::conversion::collect_type_var_bindings(
                     self_declared,
-                    self_actual,
+                    &self.anchor_host_ty(self_actual),
                     &mut type_args,
                 );
             }
@@ -2697,7 +2747,7 @@ impl BexEngine {
             // conflicting variances — contravariant function params, invariant
             // container/class args — has no consistent binding and is rejected
             // here rather than fabricated into an unsound union.
-            let pairs: Vec<(RuntimeTy, RuntimeTy)> = args
+            let pairs: Vec<(bex_vm_types::RuntimeTy, bex_vm_types::RuntimeTy)> = args
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, arg)| match (declared_param_types.get(idx), arg) {
@@ -2771,11 +2821,11 @@ impl BexEngine {
         // engine does not paper over it with a runtime-`unknown` fallback.
         // Non-generic calls bypass all of this and keep the existing permissive
         // coercion path untouched.
-        let param_types: Vec<RuntimeTy> = if callee_is_generic {
+        let param_types: Vec<bex_vm_types::RuntimeTy> = if callee_is_generic {
             // Substitute the explicit/recovered bindings into every declared
             // parameter so coercion and validation see concrete types instead
             // of bare TypeVars.
-            let substituted: Vec<RuntimeTy> = declared_param_types
+            let substituted: Vec<bex_vm_types::RuntimeTy> = declared_param_types
                 .iter()
                 .map(|t| crate::conversion::substitute_type_vars(t, &type_args))
                 .collect();
@@ -2852,7 +2902,7 @@ impl BexEngine {
                     if callee_is_generic {
                         crate::conversion::check_generic_arg(
                             &coerced,
-                            &param_types[idx],
+                            &crate::conversion::name_for_host(&param_types[idx])?,
                             caller_specified_types,
                         )
                         .map_err(|detail| EngineError::TypeMismatch {
@@ -2965,9 +3015,9 @@ impl BexEngine {
         mut thread: ActiveHeapPermit<BexThread>,
         entry_ptr: HeapPtr,
         vm_args: Vec<Value>,
-        type_args: indexmap::IndexMap<String, RuntimeTy>,
-        return_type: RuntimeTy,
-        throws_type: Option<RuntimeTy>,
+        type_args: indexmap::IndexMap<String, bex_vm_types::RuntimeTy>,
+        return_type: bex_vm_types::RuntimeTy,
+        throws_type: Option<bex_vm_types::RuntimeTy>,
         host_call_id: CallId,
         boundary: BoundaryContext,
         value_capture: TraceCaptureProducer,
@@ -3008,7 +3058,7 @@ impl BexEngine {
         // than erasing it.
         let type_args = type_args
             .into_iter()
-            .map(|(name, ty)| match baml_type::RealizedTy::try_from(&ty) {
+            .map(|(name, ty)| match bex_vm_types::RealizedTy::try_from(&ty) {
                 Ok(realized) => Ok((name, realized)),
                 Err(e) => Err(EngineError::VmInternalError(
                     bex_vm::errors::VmInternalError::TypeSubstitution {
@@ -3265,15 +3315,15 @@ impl BexEngine {
                 }
                 Object::HostClosure(host) => {
                     let throws_type = match &*host.throws_ty {
-                        baml_type::RealizedTy::Never { .. }
-                        | baml_type::RealizedTy::Void { .. } => None,
-                        ty => Some(RuntimeTy::from(ty.clone())),
+                        bex_vm_types::RealizedTy::Never { .. }
+                        | bex_vm_types::RealizedTy::Void { .. } => None,
+                        ty => Some(bex_vm_types::RuntimeTy::from(ty.clone())),
                     };
-                    let param_types: Vec<RuntimeTy> = host
+                    let param_types: Vec<bex_vm_types::RuntimeTy> = host
                         .params
                         .iter()
-                        .map(|param| RuntimeTy::from(param.ty.clone()))
-                        .collect::<Vec<_>>();
+                        .map(|param| bex_vm_types::RuntimeTy::from(param.ty.clone()))
+                        .collect();
                     let param_names = host
                         .params
                         .iter()
@@ -3286,17 +3336,17 @@ impl BexEngine {
                         })
                         .collect();
                     let param_has_default = host
-                        .params
-                        .iter()
-                        .map(baml_type::RealizedFunctionParamTy::is_optional)
-                        .collect();
+                    .params
+                    .iter()
+                    .map(baml_type::RealizedFunctionParamTy::<bex_vm_types::TypeHead>::is_optional)
+                    .collect();
                     (
                         entry_ptr,
                         None,
                         Vec::new(),
                         None,
                         Some((
-                            RuntimeTy::from((*host.ret_ty).clone()),
+                            bex_vm_types::RuntimeTy::from((*host.ret_ty).clone()),
                             throws_type,
                             host.arity,
                             param_types,
@@ -3359,11 +3409,11 @@ impl BexEngine {
                     // incoming wire values by matching them against these declared
                     // types (see `collect_type_var_bindings`). Collapsing it to
                     // `unknown` would erase what that inference reads.
-                    let slot_types: Vec<RuntimeTy> = (0..generic_param_names.len())
+                    let slot_types: Vec<bex_vm_types::RuntimeTy> = (0..generic_param_names.len())
                         .map(|i| {
                             seed_type_args.get(i).map_or_else(
                                 || {
-                                    RuntimeTy::TypeVar(
+                                    bex_vm_types::RuntimeTy::TypeVar(
                                         baml_type::ParamTy::new(
                                             u32::try_from(i).unwrap_or(u32::MAX),
                                             baml_type::Name::new(generic_param_names[i].as_str()),
@@ -3375,10 +3425,13 @@ impl BexEngine {
                             )
                         })
                         .collect();
+                    // Everything here stays head-anchored: the stored templates
+                    // already are, and the seeds were anchored on the way in. Only
+                    // the outermost host hop converts back to names.
                     (
                         func.return_type.substitute_symbolic(&slot_types),
                         match &func.throws_type {
-                            baml_type::TyTemplate::Never { .. } => None,
+                            bex_vm_types::TyTemplate::Never { .. } => None,
                             t => Some(t.substitute_symbolic(&slot_types)),
                         },
                         func.arity,
@@ -3536,7 +3589,7 @@ impl BexEngine {
         // them into the `RuntimeTy` the host `type_args` channel carries. They are
         // re-narrowed to `RealizedTy` at the `set_entry_point_with_type_args`
         // boundary inside `run_entry_point`.
-        let seed_type_args: indexmap::IndexMap<String, RuntimeTy> = seed_type_args
+        let seed_type_args: indexmap::IndexMap<String, bex_vm_types::RuntimeTy> = seed_type_args
             .into_iter()
             .enumerate()
             .map(|(i, ty)| {
@@ -3545,7 +3598,7 @@ impl BexEngine {
                         .get(i)
                         .cloned()
                         .unwrap_or_else(|| i.to_string()),
-                    RuntimeTy::from(ty),
+                    bex_vm_types::RuntimeTy::from(ty),
                 )
             })
             .collect();
@@ -3642,7 +3695,7 @@ impl BexEngine {
         // SAFETY: ptr is from resolved_function_names, a compile-time object
         let obj = unsafe { ptr.get() };
         match obj {
-            Object::Function(func) => Some(declared_symbolic(&func.return_type, func)),
+            Object::Function(func) => Some(name_declared(&func.return_type, func)),
             _ => None,
         }
     }
@@ -3655,8 +3708,8 @@ impl BexEngine {
         let obj = unsafe { ptr.get() };
         match obj {
             Object::Function(func) => match &func.throws_type {
-                baml_type::TyTemplate::Never { .. } => None,
-                t => Some(declared_symbolic(t, func)),
+                bex_vm_types::TyTemplate::Never { .. } => None,
+                t => Some(name_declared(t, func)),
             },
             _ => None,
         }
@@ -3686,7 +3739,7 @@ impl BexEngine {
                 .map(|(idx, (name, ty))| {
                     (
                         name.as_str(),
-                        declared_symbolic(ty, func),
+                        name_declared(ty, func),
                         func.param_has_default.get(idx).copied().unwrap_or(false),
                     )
                 })
@@ -3854,10 +3907,10 @@ impl BexEngine {
                             param_types: func
                                 .param_types
                                 .iter()
-                                .map(|t| declared_symbolic(t, func))
+                                .map(|t| name_declared(t, func))
                                 .collect(),
                             param_has_default: func.param_has_default.clone(),
-                            return_type: declared_symbolic(&func.return_type, func),
+                            return_type: name_declared(&func.return_type, func),
                             display_type_params: func.display_type_params.clone(),
                             display_param_types,
                             display_return_type,
@@ -4237,7 +4290,7 @@ impl BexEngine {
         _call_id: CallId,
         value: Value,
         trace: Vec<bex_vm::StackFrame>,
-        throws_type: Option<&RuntimeTy>,
+        throws_type: Option<&bex_vm_types::RuntimeTy>,
         root_capture: Option<&RootValueCaptureContext>,
     ) -> Result<ThreadOutcome, EngineError> {
         if let Some(future_id) = thread.vm_thread_settles_future() {
@@ -4263,8 +4316,9 @@ impl BexEngine {
         // `baml.panics.*` instance and would surface an internal
         // `TypeMismatch` leak instead of the clean panic. This mirrors the
         // panic bypass in [`enforce_host_throw_contract`].
-        let value_is_panic = value_runtime_baml_ty(value, thread.proof())
-            .is_some_and(|rt| matches!(&rt, RuntimeTy::Class(name, _, _) if name.is_panic_type()));
+        let value_is_panic = value_runtime_baml_ty(value, thread.proof()).is_some_and(
+            |rt| matches!(&rt, bex_vm_types::RuntimeTy::Class(name, _, _) if name.is_panic_type()),
+        );
         let external = match throws_type {
             Some(ty) if !value_is_panic => {
                 self.convert_vm_value_to_external_with_type(value, ty, thread.proof())?
@@ -4334,8 +4388,8 @@ impl BexEngine {
         thread: &mut ActiveHeapPermit<BexThread>,
         call_id: CallId,
         op_err: OpError,
-        throws_type: Option<&RuntimeTy>,
-        host_callable_throws_contract: Option<&RuntimeTy>,
+        throws_type: Option<&bex_vm_types::RuntimeTy>,
+        host_callable_throws_contract: Option<&bex_vm_types::RuntimeTy>,
         root_capture: Option<&RootValueCaptureContext>,
         call_capture: Option<&CallValueCaptureContext>,
         origin_call_capture: Option<(u64, VmCaptureMask)>,
@@ -4741,8 +4795,8 @@ impl BexEngine {
     )]
     async fn run_thread_event_loop(
         self: &Arc<Self>,
-        return_type: RuntimeTy,
-        throws_type: Option<RuntimeTy>,
+        return_type: bex_vm_types::RuntimeTy,
+        throws_type: Option<bex_vm_types::RuntimeTy>,
         thread: ActiveHeapPermit<BexThread>,
         call_id: CallId,
         root_capture: Option<RootValueCaptureContext>,
@@ -4818,8 +4872,8 @@ impl BexEngine {
     #[allow(clippy::too_many_arguments)]
     async fn run_thread_event_loop_inner(
         self: &Arc<Self>,
-        return_type: RuntimeTy,
-        throws_type: Option<RuntimeTy>,
+        return_type: bex_vm_types::RuntimeTy,
+        throws_type: Option<bex_vm_types::RuntimeTy>,
         mut thread: ActiveHeapPermit<BexThread>,
         call_id: CallId,
         root_capture: Option<RootValueCaptureContext>,
@@ -4969,7 +5023,7 @@ impl BexEngine {
                             )?;
                             let external = crate::conversion::coerce_return_to_declared_type(
                                 external,
-                                &return_type,
+                                &crate::conversion::name_for_host(&return_type)?,
                             )?;
                             (external.clone(), external)
                         }
@@ -4981,7 +5035,7 @@ impl BexEngine {
                         )?;
                         let external = crate::conversion::coerce_return_to_declared_type(
                             external,
-                            &return_type,
+                            &crate::conversion::name_for_host(&return_type)?,
                         )?;
                         (external.clone(), external)
                     };
@@ -5069,7 +5123,7 @@ impl BexEngine {
                     // that doesn't match `E` becomes a
                     // `baml.panics.HostContractViolation` panic instead of
                     // a catchable throw.
-                    let host_ret_ty: Option<baml_type::RuntimeTy> =
+                    let host_ret_ty: Option<bex_vm_types::RuntimeTy> =
                         if operation == SysOp::BamlHostCallHostValue {
                             Some(
                                 host_call_type_arg(args.get(2).copied(), 2, "ret_ty")
@@ -5078,7 +5132,7 @@ impl BexEngine {
                         } else {
                             None
                         };
-                    let host_throws_ty: Option<baml_type::RuntimeTy> =
+                    let host_throws_ty: Option<bex_vm_types::RuntimeTy> =
                         if operation == SysOp::BamlHostCallHostValue {
                             Some(
                                 host_call_type_arg(args.get(3).copied(), 3, "throws_ty")
@@ -5167,8 +5221,11 @@ impl BexEngine {
                             // catch it exactly like a host-raised error.
                             if operation == SysOp::BamlHostCallHostValue
                                 && let Some(ret_ty) = host_ret_ty.as_ref()
-                                && let Err(message) =
-                                    self.validate_host_return_schema(&external, ret_ty)
+                                && let Err(message) = crate::conversion::name_for_host(ret_ty)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|named| {
+                                        self.validate_host_return_schema(&external, &named)
+                                    })
                             {
                                 // A wrong-return-type at the engine-level
                                 // schema check is the same kind of contract

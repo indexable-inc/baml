@@ -30,12 +30,12 @@ use smallvec::SmallVec;
 /// fallback, matching the host's De Bruijn send order.
 fn lower_named_type_args(
     param_names: &[String],
-    type_args: IndexMap<String, baml_type::RealizedTy>,
-) -> Vec<baml_type::RealizedTy> {
+    type_args: IndexMap<String, bex_vm_types::RealizedTy>,
+) -> Vec<bex_vm_types::RealizedTy> {
     if param_names.is_empty() {
         return type_args.into_iter().map(|(_, ty)| ty).collect();
     }
-    let mut positional = vec![baml_type::RealizedTy::unknown(); param_names.len()];
+    let mut positional = vec![bex_vm_types::RealizedTy::unknown(); param_names.len()];
     for (name, ty) in type_args {
         if let Some(idx) = param_names.iter().position(|p| *p == name) {
             positional[idx] = ty;
@@ -105,7 +105,7 @@ pub const MAX_FRAMES: usize = 256;
 #[derive(Clone, Copy)]
 struct CallOptions<'a> {
     runtime_id: Option<Value>,
-    type_args: &'a [baml_type::RealizedTy],
+    type_args: &'a [bex_vm_types::RealizedTy],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -204,7 +204,7 @@ pub struct BytecodeFrame {
     /// concrete type, seeded from the callee's realized `Object` type args
     /// (`GenericFunction`/`BoundMethod`/`Closure`/`Instance`), so a `LoadType`
     /// substitutes them into a fully realized type.
-    pub type_args: Vec<baml_type::RealizedTy>,
+    pub type_args: Vec<bex_vm_types::RealizedTy>,
     /// Byte offset of the most recently dispatched opcode (compact path).
     /// In the legacy path this mirrors `instruction_ptr - 1` and is kept
     /// up-to-date before each `step()` call.
@@ -352,7 +352,7 @@ pub(crate) mod tests {
             local_names: Vec::new(),
             debug_locals: Vec::new(),
             span: baml_type::Span::fake(),
-            return_type: baml_type::TyTemplate::Int {
+            return_type: bex_vm_types::TyTemplate::Int {
                 attr: baml_type::TyAttr::default(),
             },
             param_names: Vec::new(),
@@ -361,7 +361,7 @@ pub(crate) mod tests {
             display_type_params: Vec::new(),
             display_param_types: Vec::new(),
             display_return_type: "int".to_string(),
-            throws_type: baml_type::TyTemplate::Never {
+            throws_type: bex_vm_types::TyTemplate::Never {
                 attr: baml_type::TyAttr::default(),
             },
             origin: FunctionOrigin::Internal,
@@ -751,7 +751,7 @@ pub struct BexVm {
     /// Saved/restored across nested `Call` instructions; native handlers that
     /// re-enter the VM (via `YieldToCall`) therefore see their own type-args
     /// even if the inner callback uses different ones.
-    pending_call_type_args: Vec<baml_type::RealizedTy>,
+    pending_call_type_args: Vec<bex_vm_types::RealizedTy>,
 }
 
 /// VM execution state.
@@ -1006,15 +1006,18 @@ fn value_as_float(value: Value) -> Option<f64> {
 /// its function's type with the receiver already applied.
 ///
 /// [`ConcreteRealizedTy::Function`]: baml_type::ConcreteRealizedTy::Function
-fn function_object_ty<C: baml_type::normalize::TypeContext>(
+fn function_object_ty<C: baml_type::normalize::TypeContext<bex_vm_types::TypeHead>>(
     ctx: &C,
     f: &bex_vm_types::types::Function,
-    type_args: &[baml_type::RealizedTy],
+    type_args: &[bex_vm_types::RealizedTy],
     drop_receiver: bool,
-) -> Result<baml_type::ConcreteRealizedTy, VmInternalError> {
-    use baml_type::{ConcreteRealizedTy, FunctionParamMode, RealizedFunctionParamTy, TyAttr};
+) -> Result<baml_type::ConcreteRealizedTy<bex_vm_types::TypeHead>, VmInternalError> {
+    use baml_type::{FunctionParamMode, TyAttr};
+
+    type ConcreteRealizedTy = baml_type::ConcreteRealizedTy<bex_vm_types::TypeHead>;
+    type RealizedFunctionParamTy = baml_type::RealizedFunctionParamTy<bex_vm_types::TypeHead>;
     let materialize =
-        |t: &baml_type::TyTemplate| -> Result<baml_type::RealizedTy, VmInternalError> {
+        |t: &bex_vm_types::TyTemplate| -> Result<bex_vm_types::RealizedTy, VmInternalError> {
             t.substitute(type_args, ctx)
                 .map_err(|e| VmInternalError::TypeSubstitution {
                     message: e.to_string(),
@@ -1058,12 +1061,12 @@ pub(crate) struct CallableSignature {
     /// The declaration's fully qualified name; `None` for host closures and
     /// compiler-synthesized callables (lambda names are `<lambda(...)>`).
     pub(crate) name: Option<String>,
-    pub(crate) params: Vec<baml_type::RealizedFunctionParamTy>,
-    pub(crate) ret: baml_type::RealizedTy,
+    pub(crate) params: Vec<baml_type::RealizedFunctionParamTy<bex_vm_types::TypeHead>>,
+    pub(crate) ret: bex_vm_types::RealizedTy,
     /// The error type; `never` when the callable cannot throw — the same
     /// spelling a function *type* uses, so a value's reconstructed signature
     /// and its written type agree.
-    pub(crate) throws: baml_type::RealizedTy,
+    pub(crate) throws: bex_vm_types::RealizedTy,
     /// The declaration's joined `///` doc-comment lines, if any.
     pub(crate) docstring: Option<String>,
 }
@@ -1076,10 +1079,10 @@ pub(crate) struct CallableSignature {
 /// Shares [`function_object_ty`]'s contract: substitution realizes fully or the
 /// frame layout is broken, so there is no coarse fallback. Reflection reports
 /// the same type the matcher tests against.
-fn function_callable_signature<C: baml_type::normalize::TypeContext>(
+fn function_callable_signature<C: baml_type::normalize::TypeContext<bex_vm_types::TypeHead>>(
     ctx: &C,
     f: &bex_vm_types::types::Function,
-    type_args: &[baml_type::RealizedTy],
+    type_args: &[bex_vm_types::RealizedTy],
     drop_receiver: bool,
 ) -> Result<CallableSignature, VmInternalError> {
     use baml_type::ConcreteRealizedTy;
@@ -1276,7 +1279,7 @@ impl BexVm {
     ///
     /// Returns an empty slice for calls with `ntypeargs == 0` and from outside
     /// any call dispatch context.
-    pub fn current_call_type_args(&self) -> &[baml_type::RealizedTy] {
+    pub fn current_call_type_args(&self) -> &[bex_vm_types::RealizedTy] {
         &self.pending_call_type_args
     }
 
@@ -1284,7 +1287,7 @@ impl BexVm {
         &mut self,
         start: usize,
         count: usize,
-    ) -> Result<Vec<baml_type::RealizedTy>, VmError> {
+    ) -> Result<Vec<bex_vm_types::RealizedTy>, VmError> {
         let end = start
             .checked_add(count)
             .filter(|end| *end <= self.stack.len())
@@ -1309,7 +1312,7 @@ impl BexVm {
         &mut self,
         type_arg_count: usize,
         value_count: usize,
-    ) -> Result<Vec<baml_type::RealizedTy>, VmError> {
+    ) -> Result<Vec<bex_vm_types::RealizedTy>, VmError> {
         let input_count = type_arg_count
             .checked_add(value_count)
             .expect("VM operand count fits in usize");
@@ -1321,7 +1324,7 @@ impl BexVm {
         self.take_type_args(start, type_arg_count)
     }
 
-    fn pop_type_args(&mut self, count: usize) -> Result<Vec<baml_type::RealizedTy>, VmError> {
+    fn pop_type_args(&mut self, count: usize) -> Result<Vec<bex_vm_types::RealizedTy>, VmError> {
         self.take_type_args_below_values(count, 0)
     }
 
@@ -1553,14 +1556,14 @@ impl BexVm {
     /// `unknown`. The generated array-receiver glue calls this to build the
     /// [`ArrayView`](crate::package_baml::ArrayView) it hands a builtin, so a
     /// type-preserving builtin (e.g. `filter`) can tag its result array.
-    pub fn array_element_ty(&self, value: &Value) -> baml_type::RealizedTy {
+    pub fn array_element_ty(&self, value: &Value) -> bex_vm_types::RealizedTy {
         value
             .as_object_ptr()
             .and_then(|ptr| match self.get_object(ptr) {
                 Object::Array(arr) => Some((*arr.element_ty).clone()),
                 _ => None,
             })
-            .unwrap_or_else(baml_type::RealizedTy::unknown)
+            .unwrap_or_else(bex_vm_types::RealizedTy::unknown)
     }
 
     /// The declared key type of `value` when it is an `Object::Map`, else
@@ -1568,27 +1571,27 @@ impl BexVm {
     /// [`Self::map_value_ty`]) to build the
     /// [`MapView`](crate::package_baml::MapView) it hands a builtin, so a
     /// type-preserving builtin can tag its result map.
-    pub fn map_key_ty(&self, value: &Value) -> baml_type::RealizedTy {
+    pub fn map_key_ty(&self, value: &Value) -> bex_vm_types::RealizedTy {
         value
             .as_object_ptr()
             .and_then(|ptr| match self.get_object(ptr) {
                 Object::Map(map) => Some((*map.key_ty).clone()),
                 _ => None,
             })
-            .unwrap_or_else(baml_type::RealizedTy::unknown)
+            .unwrap_or_else(bex_vm_types::RealizedTy::unknown)
     }
 
     /// The declared value type of `value` when it is an `Object::Map`, else
     /// `unknown`. The map analogue of [`Self::array_element_ty`]; see
     /// [`Self::map_key_ty`].
-    pub fn map_value_ty(&self, value: &Value) -> baml_type::RealizedTy {
+    pub fn map_value_ty(&self, value: &Value) -> bex_vm_types::RealizedTy {
         value
             .as_object_ptr()
             .and_then(|ptr| match self.get_object(ptr) {
                 Object::Map(map) => Some((*map.value_ty).clone()),
                 _ => None,
             })
-            .unwrap_or_else(baml_type::RealizedTy::unknown)
+            .unwrap_or_else(bex_vm_types::RealizedTy::unknown)
     }
 
     /// Realize a class field's type template against an instance's realized class
@@ -1600,9 +1603,9 @@ impl BexVm {
     /// surfaced as a panic rather than a silent `unknown`.
     pub(crate) fn realize_field_ty(
         &self,
-        template: &baml_type::TyTemplate,
-        class_type_args: &[baml_type::RealizedTy],
-    ) -> baml_type::RealizedTy {
+        template: &bex_vm_types::TyTemplate,
+        class_type_args: &[bex_vm_types::RealizedTy],
+    ) -> bex_vm_types::RealizedTy {
         template
             .substitute(class_type_args, self)
             .unwrap_or_else(|e| {
@@ -1627,69 +1630,39 @@ impl BexVm {
         unsafe { ptr.get() }
     }
 
-    /// The `Object::Package` for `pkg`, if loaded.
-    fn package(&self, pkg: &Name) -> Option<&bex_vm_types::types::Package> {
-        self.get_object(self.packages.package_ptr(pkg)?)
-            .as_package()
+    /// The declaration a type head names.
+    ///
+    /// Prefer this to [`TypeHead::ptr`](bex_vm_types::TypeHead::ptr) anywhere a
+    /// head may not have come from the loader. A head minted at runtime — by
+    /// `TypeHead::of_name`, say — carries the right identity but a null pointer,
+    /// so dereferencing it directly is a crash rather than a lookup failure.
+    /// Returns `None` when no loaded declaration claims the tag, which is a type
+    /// the caller cannot serve.
+    pub fn declaration(&self, head: bex_vm_types::TypeHead) -> Option<HeapPtr> {
+        self.packages.declaration_of(head)
     }
 
-    /// Look up a class or enum object by its qualified type name. Classes and
-    /// enums share one type namespace, so a name resolves to at most one object.
-    pub fn lookup_type(&self, qtn: &baml_type::TypeName) -> Option<HeapPtr> {
-        let package = self.package(qtn.package())?;
-        let local = bex_vm_types::types::LocalName {
-            namespace: qtn.namespace().clone(),
-            name: qtn.name().clone(),
-        };
-        package
-            .classes
-            .get(&local)
-            .or_else(|| package.enums.get(&local))
-            .copied()
+    /// The head of the *interface* named `qtn`, if the program declares one.
+    ///
+    /// [`PackageIndex::declaration_named`](crate::package_load::PackageIndex::declaration_named)
+    /// narrowed to interfaces, for callers naming a builtin by literal FQN — the
+    /// operator interfaces in `baml.ops`, say. A class that happens to share the
+    /// name is not an answer, so this checks the kind rather than trusting the
+    /// shared name space.
+    pub fn interface_head(&self, qtn: &baml_type::TypeName) -> Option<bex_vm_types::TypeHead> {
+        let head = self.packages.declaration_named(qtn)?;
+        matches!(self.get_object(head.ptr()), Object::Interface(_)).then_some(head)
     }
 
-    /// Look up an interface object by its qualified type name. The returned
-    /// pointer is the canonical `Object::Interface` for the interface — the same
-    /// pointer that keys every package's [`bex_vm_types::types::Package::impl_rules`], so it can be
-    /// used to resolve an interface's impls in O(1).
-    pub fn lookup_interface(&self, qtn: &baml_type::TypeName) -> Option<HeapPtr> {
-        let local = bex_vm_types::types::LocalName {
-            namespace: qtn.namespace().clone(),
-            name: qtn.name().clone(),
-        };
-        self.package(qtn.package())?.interfaces.get(&local).copied()
-    }
-
-    /// Look up a class or enum object by its fully-qualified dotted name, with the
-    /// package as the leading segment. For builtin (dependency-package) types
-    /// referenced by constant FQN; not valid for `user`-package types, whose
-    /// rendered name elides the package — use [`Self::lookup_type`] there.
+    /// Look up a class or enum object by its fully-qualified dotted name, with
+    /// the package as the leading segment.
+    ///
+    /// For builtin types named by a constant FQN in Rust source — the only
+    /// remaining name-keyed access, because a literal in Rust *is* a name. A
+    /// type reached from BAML carries a [`TypeHead`](bex_vm_types::TypeHead);
+    /// resolve that through [`Self::declaration`] instead.
     pub fn lookup_type_by_fqn(&self, fqn: &str) -> Option<HeapPtr> {
         crate::package_load::lookup_type_by_fqn(&self.packages, fqn)
-    }
-
-    /// The recursive type-alias definition for `qtn`, if any (only recursive
-    /// aliases survive to runtime; non-recursive ones are expanded inline).
-    ///
-    /// Reads through the package's `Object::TypeAlias` rather than a side map —
-    /// the indirection a nominal reference will eventually point at directly.
-    pub fn recursive_type_alias(
-        &self,
-        qtn: &baml_type::TypeName,
-    ) -> Option<&baml_type::RealizedTy> {
-        let local = bex_vm_types::types::LocalName {
-            namespace: qtn.namespace().clone(),
-            name: qtn.name().clone(),
-        };
-        let alias_ptr = *self.package(qtn.package())?.type_aliases.get(&local)?;
-        // SAFETY: a package's alias map holds only compile-time
-        // `Object::TypeAlias` pointers, valid for the heap's lifetime.
-        #[expect(unsafe_code, reason = "deref a compile-time alias pointer")]
-        let object = unsafe { alias_ptr.get() };
-        match object {
-            Object::TypeAlias(alias) => Some(&alias.definition),
-            _ => None,
-        }
     }
 
     /// Every class and enum object across all loaded packages.
@@ -1770,7 +1743,7 @@ impl BexVm {
     /// resolved against the frame's type args. Opcodes whose type operands ride
     /// the stack rather than the instruction stream (`AllocArray`, `AllocMap`,
     /// `Spawn`) consume them this way.
-    fn ensure_pop_type(&mut self) -> Result<baml_type::RealizedTy, VmInternalError> {
+    fn ensure_pop_type(&mut self) -> Result<bex_vm_types::RealizedTy, VmInternalError> {
         let value = self.stack.ensure_pop();
         let ptr = self.as_object_ptr(value, ObjectType::Type)?;
         match self.get_object(ptr) {
@@ -2006,8 +1979,13 @@ impl BexVm {
     /// The interface resolver wants the loose `RuntimeTy`, so the sole such caller
     /// widens the result back; the `IsType` value matcher wants the invariant made
     /// explicit and uses it directly.
-    pub(crate) fn value_concrete_ty(&self, value: Value) -> Option<baml_type::ConcreteRealizedTy> {
-        use baml_type::{ConcreteRealizedTy, TyAttr};
+    pub(crate) fn value_concrete_ty(
+        &self,
+        value: Value,
+    ) -> Option<baml_type::ConcreteRealizedTy<bex_vm_types::TypeHead>> {
+        use baml_type::TyAttr;
+
+        type ConcreteRealizedTy = baml_type::ConcreteRealizedTy<bex_vm_types::TypeHead>;
         if value.as_int().is_some() {
             return Some(ConcreteRealizedTy::Int {
                 attr: TyAttr::default(),
@@ -2052,7 +2030,7 @@ impl BexVm {
                         // realized (`Box<int>` ⇒ `T = int`), so they are exactly the
                         // `ConcreteRealizedTy::Class` argument list.
                         ConcreteRealizedTy::Class(
-                            class.name.clone(),
+                            bex_vm_types::TypeHead::new(inst.class, class.type_tag),
                             inst.class_type_args.to_vec(),
                             TyAttr::default(),
                         )
@@ -2064,7 +2042,10 @@ impl BexVm {
                 ),
             },
             Object::Variant(v) => match self.get_object(v.enm) {
-                Object::Enum(e) => ConcreteRealizedTy::Enum(e.name.clone(), TyAttr::default()),
+                Object::Enum(e) => ConcreteRealizedTy::Enum(
+                    bex_vm_types::TypeHead::new(v.enm, e.type_tag),
+                    TyAttr::default(),
+                ),
                 other => unreachable!(
                     "Variant.enm must point to an Enum, found {:?}",
                     ObjectType::of(other)
@@ -2351,7 +2332,7 @@ impl BexVm {
         // inherited positional slots — so fall back to the index as a key; the
         // named lowering then emits the unnamed bindings in order.
         let param_names = self.entry_point_generic_param_names(function);
-        let type_args: IndexMap<String, baml_type::RealizedTy> = positional
+        let type_args: IndexMap<String, bex_vm_types::RealizedTy> = positional
             .into_iter()
             .enumerate()
             .map(|(i, ty)| {
@@ -2386,7 +2367,7 @@ impl BexVm {
         &mut self,
         function: HeapPtr,
         args: &[Value],
-        type_args: IndexMap<String, baml_type::RealizedTy>,
+        type_args: IndexMap<String, bex_vm_types::RealizedTy>,
     ) {
         debug_assert!(
             matches!(
@@ -2521,7 +2502,7 @@ impl BexVm {
         &mut self,
         function: HeapPtr,
         args: &[Value],
-        type_args: Vec<baml_type::RealizedTy>,
+        type_args: Vec<bex_vm_types::RealizedTy>,
         callable_kind: FunctionKind,
     ) {
         let callee_global = self
@@ -2625,8 +2606,8 @@ impl BexVm {
                 // args, so nothing is left to substitute.
                 (
                     hc.arity,
-                    baml_type::TyTemplate::from((*hc.ret_ty).clone()),
-                    baml_type::TyTemplate::from((*hc.throws_ty).clone()),
+                    bex_vm_types::TyTemplate::from((*hc.ret_ty).clone()),
+                    bex_vm_types::TyTemplate::from((*hc.throws_ty).clone()),
                 )
             }
             other => unreachable!("expect host closure as entry point, got {other:?}"),
@@ -3307,7 +3288,7 @@ impl BexVm {
         // element type.
         let frames_array = Value::object(
             self.tlab
-                .alloc_array(baml_type::RealizedTy::unknown(), frames),
+                .alloc_array(bex_vm_types::RealizedTy::unknown(), frames),
         );
         self.alloc_error_value(ErrorClass::StackTrace, vec![frames_array])
     }
@@ -3431,12 +3412,12 @@ impl BexVm {
     fn pop_interface_operand(
         &mut self,
         iface_value: Value,
-    ) -> Result<(baml_type::TypeName, Vec<baml_type::RealizedTy>), VmError> {
+    ) -> Result<(bex_vm_types::TypeHead, Vec<bex_vm_types::RealizedTy>), VmError> {
         let iface_ptr = self.as_object_ptr(iface_value, ObjectType::Type)?;
         match self.get_object(iface_ptr) {
             Object::Type(ty) => match ty.as_ref() {
-                baml_type::RealizedTy::Interface(qtn, args, _assoc, _attr) => {
-                    Ok((qtn.clone(), args.clone()))
+                bex_vm_types::RealizedTy::Interface(qtn, args, _assoc, _attr) => {
+                    Ok((*qtn, args.clone()))
                 }
                 other => unreachable!(
                     "virtual field access interface operand must be an Interface type, \
@@ -3462,12 +3443,12 @@ impl BexVm {
     fn resolve_virtual_field_slot(
         &mut self,
         receiver: Value,
-        iface_qtn: &baml_type::TypeName,
-        iface_args: &[baml_type::RealizedTy],
+        iface_qtn: &bex_vm_types::TypeHead,
+        iface_args: &[bex_vm_types::RealizedTy],
         field_index: usize,
     ) -> Result<usize, VmError> {
         let self_ty =
-            baml_type::RealizedTy::from(self.value_concrete_ty(receiver).unwrap_or_else(|| {
+            bex_vm_types::RealizedTy::from(self.value_concrete_ty(receiver).unwrap_or_else(|| {
                 unreachable!(
                     "value of kind {:?} cannot be a virtual field-access receiver",
                     self.type_of(&receiver)
@@ -3988,7 +3969,7 @@ impl BexVm {
     pub(crate) fn bound_method_curried_type_args(
         &self,
         receiver: Value,
-    ) -> Box<[baml_type::RealizedTy]> {
+    ) -> Box<[bex_vm_types::RealizedTy]> {
         match receiver.as_object_ptr() {
             Some(ptr) => match self.get_object(ptr) {
                 Object::Instance(inst) => inst.class_type_args.clone(),
@@ -4401,14 +4382,14 @@ impl BexVm {
         // a host callable accepts arbitrary argument types.
         let positional_ptr = self
             .tlab
-            .alloc_array(baml_type::RealizedTy::unknown(), positional);
+            .alloc_array(bex_vm_types::RealizedTy::unknown(), positional);
         let optional_ptr = self.tlab.alloc_map(
-            baml_type::RealizedTy::string(),
-            baml_type::RealizedTy::unknown(),
+            bex_vm_types::RealizedTy::string(),
+            bex_vm_types::RealizedTy::unknown(),
             optional,
         );
         let args_array_ptr = self.tlab.alloc_array(
-            baml_type::RealizedTy::unknown(),
+            bex_vm_types::RealizedTy::unknown(),
             vec![Value::object(positional_ptr), Value::object(optional_ptr)],
         );
         let ret_ty_ptr = self.tlab.alloc(Object::Type(Box::new(ret_ty)));
@@ -4548,8 +4529,8 @@ impl BexVm {
         // BytecodeFrame after it is created.
         let (is_host, closure_type_args, bound_method_class_type_args): (
             bool,
-            Box<[baml_type::RealizedTy]>,
-            Box<[baml_type::RealizedTy]>,
+            Box<[bex_vm_types::RealizedTy]>,
+            Box<[bex_vm_types::RealizedTy]>,
         ) = match self.get_object(callee_ptr) {
             Object::HostClosure(_) => (true, Box::new([]), Box::new([])),
             Object::Closure(c) => (false, c.captured_type_args.clone(), Box::new([])),
@@ -4587,7 +4568,7 @@ impl BexVm {
         // (reflect.type_of<T>, json natives) resolve T at runtime. (The
         // Closure/BoundMethod type args are classified in the consolidated match
         // above; GenericFunction is specific to generic instantiation values.)
-        let gf_type_args: Box<[baml_type::RealizedTy]> = match self.get_object(callee_ptr) {
+        let gf_type_args: Box<[bex_vm_types::RealizedTy]> = match self.get_object(callee_ptr) {
             Object::GenericFunction(gf) => gf.type_args.clone(),
             _ => Box::new([]),
         };
@@ -4715,7 +4696,7 @@ impl BexVm {
                 // `gf_type_args`; a closure-wrapped value
                 // (`let g = baml.json.from_string; let f = g<User>`) carries them
                 // on the closure's `captured_type_args`. Use whichever is set.
-                let native_type_args: &[baml_type::RealizedTy] = if !gf_type_args.is_empty() {
+                let native_type_args: &[bex_vm_types::RealizedTy] = if !gf_type_args.is_empty() {
                     &gf_type_args
                 } else {
                     &closure_type_args
@@ -6362,8 +6343,8 @@ impl BexVm {
                             // interfaces carry none and resolve by name + `Self`.
                             // Associated types are outputs, not part of the key.
                             Object::Type(ty) => match ty.as_ref() {
-                                baml_type::RealizedTy::Interface(qtn, args, _assoc, _attr) => {
-                                    (qtn.clone(), args.clone())
+                                bex_vm_types::RealizedTy::Interface(qtn, args, _assoc, _attr) => {
+                                    (*qtn, args.clone())
                                 }
                                 other => unreachable!(
                                     "VirtualCall interface operand must be an Interface type, found {other:?}"
@@ -6391,7 +6372,7 @@ impl BexVm {
                     // before the `&mut self` call below.
                     let receiver = self.stack[StackIndex::from_raw(args_offset)];
                     // `Self` is the receiver value's realized concrete type.
-                    let self_ty = baml_type::RealizedTy::from(
+                    let self_ty = bex_vm_types::RealizedTy::from(
                         self.value_concrete_ty(receiver).unwrap_or_else(|| {
                             unreachable!(
                                 "value of kind {:?} cannot be a virtual-call receiver",
@@ -6975,14 +6956,14 @@ impl BexVm {
                         }
                     };
 
-                    let ty: baml_type::RealizedTy = {
+                    let ty: bex_vm_types::RealizedTy = {
                         // A fully-realized template narrows to `RealizedTy` in a
                         // single validation walk — no substitution environment
                         // needed. Otherwise resolve its frame refs (and reduce any
                         // projection) against the frame's realized type args; the
                         // result must be realized or it is an internal error, never
                         // a `unknown` erasure.
-                        if let Ok(realized) = <&baml_type::RealizedTy>::try_from(&template) {
+                        if let Ok(realized) = <&bex_vm_types::RealizedTy>::try_from(&template) {
                             realized.clone()
                         } else {
                             let frame_type_args =
@@ -7044,8 +7025,8 @@ impl BexVm {
                         let iface_ptr = self.as_object_ptr(iface_value, ObjectType::Type)?;
                         match self.get_object(iface_ptr) {
                             Object::Type(ty) => match ty.as_ref() {
-                                baml_type::RealizedTy::Interface(qtn, args, _assoc, _attr) => {
-                                    (qtn.clone(), args.clone())
+                                bex_vm_types::RealizedTy::Interface(qtn, args, _assoc, _attr) => {
+                                    (*qtn, args.clone())
                                 }
                                 other => unreachable!(
                                     "MakeVirtualBoundMethod interface operand must be an \
@@ -7064,7 +7045,7 @@ impl BexVm {
                     let method_type_args = self.pop_type_args(ntypeargs)?;
                     let receiver = self.stack.ensure_pop();
                     // `Self` is the receiver value's realized concrete type.
-                    let self_ty = baml_type::RealizedTy::from(
+                    let self_ty = bex_vm_types::RealizedTy::from(
                         self.value_concrete_ty(receiver).unwrap_or_else(|| {
                             unreachable!(
                                 "value of kind {:?} cannot be a virtual bound-method receiver",
@@ -7141,7 +7122,7 @@ impl BexVm {
                     // `T` at runtime, and — unlike closure-wrapping it — never
                     // crashes. (`GenericFunction` does not reach here: TIR rejects
                     // type args on an already-specialized value.)
-                    let wrap: Option<(HeapPtr, Vec<Value>, Vec<baml_type::RealizedTy>)> =
+                    let wrap: Option<(HeapPtr, Vec<Value>, Vec<bex_vm_types::RealizedTy>)> =
                         match self.get_object(callable_ptr) {
                             Object::Function(_) => Some((callable_ptr, Vec::new(), Vec::new())),
                             Object::Closure(c) => Some((

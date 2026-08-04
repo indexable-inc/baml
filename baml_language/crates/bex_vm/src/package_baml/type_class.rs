@@ -100,7 +100,7 @@ impl BamlClassTypeValue for PackageBamlImpl {
 
 /// The concrete `RealizedTy` wrapped by a `type` value (class, enum, interface,
 /// primitive, container, …), or `None` if `value` isn't a `type`.
-fn type_value_ty(vm: &BexVm, value: Value) -> Option<baml_type::RealizedTy> {
+fn type_value_ty(vm: &BexVm, value: Value) -> Option<bex_vm_types::RealizedTy> {
     match vm.get_object(value.as_object_ptr()?) {
         Object::Type(ty) => Some(ty.as_ref().clone()),
         _ => None,
@@ -110,9 +110,9 @@ fn type_value_ty(vm: &BexVm, value: Value) -> Option<baml_type::RealizedTy> {
 /// A realized interface instantiation as reflected off a value: the type's
 /// qualified name, its realized generic arguments, and its associated bindings.
 type RealizedTypeInstantiation = (
-    baml_type::TypeName,
-    Vec<baml_type::RealizedTy>,
-    Vec<(baml_type::Name, baml_type::RealizedTy)>,
+    bex_vm_types::TypeHead,
+    Vec<bex_vm_types::RealizedTy>,
+    Vec<(baml_type::Name, bex_vm_types::RealizedTy)>,
 );
 
 /// Returns the type's base name plus its generic arguments (e.g.
@@ -124,13 +124,11 @@ fn ty_name_args_and_assoc(vm: &BexVm, value: Value) -> Option<RealizedTypeInstan
         return None;
     };
     match ty.as_ref() {
-        baml_type::RealizedTy::Class(name, args, _) => {
-            Some((name.clone(), args.clone(), Vec::new()))
+        bex_vm_types::RealizedTy::Class(name, args, _) => Some((*name, args.clone(), Vec::new())),
+        bex_vm_types::RealizedTy::Interface(name, args, associated_bindings, _) => {
+            Some((*name, args.clone(), associated_bindings.clone()))
         }
-        baml_type::RealizedTy::Interface(name, args, associated_bindings, _) => {
-            Some((name.clone(), args.clone(), associated_bindings.clone()))
-        }
-        baml_type::RealizedTy::Enum(name, _) => Some((name.clone(), Vec::new(), Vec::new())),
+        bex_vm_types::RealizedTy::Enum(name, _) => Some((*name, Vec::new(), Vec::new())),
         other => primitive_type_name(other).map(|name| (name, Vec::new(), Vec::new())),
     }
 }
@@ -141,17 +139,19 @@ fn ty_name_args_and_assoc(vm: &BexVm, value: Value) -> Option<RealizedTypeInstan
 /// structural — the registry bakes their for-types as `Concrete(RuntimeTy::Int { .. })`
 /// etc. (`baml_compiler2_mir`'s `tir2_to_template`), matched by `resolve::match_template`
 /// — so this is a reflection key, never compared against a baked pattern.
-fn primitive_type_name(ty: &baml_type::RealizedTy) -> Option<baml_type::TypeName> {
+fn primitive_type_name(ty: &bex_vm_types::RealizedTy) -> Option<bex_vm_types::TypeHead> {
     let name = match ty {
-        baml_type::RealizedTy::Int { .. } => "int",
-        baml_type::RealizedTy::Bigint { .. } => "bigint",
-        baml_type::RealizedTy::Float { .. } => "float",
-        baml_type::RealizedTy::String { .. } => "string",
-        baml_type::RealizedTy::Bool { .. } => "bool",
-        baml_type::RealizedTy::Null { .. } => "null",
+        bex_vm_types::RealizedTy::Int { .. } => "int",
+        bex_vm_types::RealizedTy::Bigint { .. } => "bigint",
+        bex_vm_types::RealizedTy::Float { .. } => "float",
+        bex_vm_types::RealizedTy::String { .. } => "string",
+        bex_vm_types::RealizedTy::Bool { .. } => "bool",
+        bex_vm_types::RealizedTy::Null { .. } => "null",
         _ => return None,
     };
-    Some(baml_type::QualifiedTypeName::local(baml_type::Name::new(
-        name,
-    )))
+    // A primitive has no declaration, so this is the head a `implement I for int`
+    // rule is keyed by — an unresolved head, since identity is the tag.
+    Some(bex_vm_types::TypeHead::of_name(
+        &baml_type::QualifiedTypeName::local(baml_type::Name::new(name)),
+    ))
 }

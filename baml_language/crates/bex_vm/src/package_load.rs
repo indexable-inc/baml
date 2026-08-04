@@ -38,7 +38,7 @@ struct PackageSlots {
 fn placeholder() -> Object {
     Object::ImplRule(Box::new(RuntimeImplRule {
         interface_head: HeapPtr::null(),
-        for_ty_pattern: baml_type::TyTemplate::TypeArgRef(0),
+        for_ty_pattern: bex_vm_types::TyTemplate::TypeArgRef(0),
         generic_param_bounds: Vec::new(),
         interface_args: Vec::new(),
         interface_assoc: Vec::new(),
@@ -110,12 +110,70 @@ pub struct PackageIndex {
     /// Canonical `Object::Interface` pointer → every `Object::ImplRule` of that
     /// interface in the program, in package-load order.
     impl_rules: IndexMap<HeapPtr, Vec<HeapPtr>>,
+    /// Every declared head's tag → its declaration.
+    ///
+    /// A head minted from a name alone (`TypeHead::of_name`) is unresolved, and
+    /// several runtime sites do exactly that to name a known builtin — the
+    /// operator interfaces, say. Identity still compares correctly, but the
+    /// pointer is null, so any site that needs to *reach* the declaration
+    /// resolves through here first.
+    by_tag: std::collections::HashMap<baml_type::typetag::TypeTag, HeapPtr>,
 }
 
 impl PackageIndex {
     /// The `Object::Package` pointer for `name`, if the package is loaded.
     pub fn package_ptr(&self, name: &Name) -> Option<HeapPtr> {
         self.by_name.get(name).copied()
+    }
+
+    /// The declaration `head` names, resolving it if the head itself is not.
+    ///
+    /// Prefer this over `head.ptr()` wherever the head may have been minted from
+    /// a name rather than read out of a loaded object.
+    pub fn declaration_of(&self, head: bex_vm_types::TypeHead) -> Option<HeapPtr> {
+        if head.is_resolved() {
+            return Some(head.ptr());
+        }
+        self.by_tag.get(&head.tag()).copied()
+    }
+
+    /// The head of the declaration `qtn` names, if the program declares it.
+    ///
+    /// The one way a *name* becomes a head at runtime. Names are what
+    /// `Object::Package` is keyed by, so a name resolves through the package
+    /// rather than around it: the package's maps are the program's declared
+    /// surface, and a name outside that surface names no type this program has.
+    /// Content-addressing the name instead would answer for any string whose tag
+    /// happened to collide with something loaded, which is not the same question.
+    ///
+    /// Both halves of the head come off the declaration, so it arrives resolved
+    /// and needs no second lookup. Kind-agnostic: classes, enums, interfaces and
+    /// recursive aliases share one name space, so at most one map can claim a
+    /// given name.
+    pub fn declaration_named(&self, qtn: &baml_type::TypeName) -> Option<bex_vm_types::TypeHead> {
+        let pkg_ptr = self.package_ptr(qtn.package())?;
+        // SAFETY: `by_name` only ever holds compile-time `Object::Package`
+        // pointers (built by `fill_package_slots`), valid for the heap's lifetime.
+        #[expect(unsafe_code, reason = "deref a compile-time package pointer")]
+        let package = (unsafe { pkg_ptr.get() }).as_package()?;
+        let local = LocalName {
+            namespace: qtn.namespace().clone(),
+            name: qtn.name().clone(),
+        };
+        let ptr = *package
+            .classes
+            .get(&local)
+            .or_else(|| package.enums.get(&local))
+            .or_else(|| package.interfaces.get(&local))
+            .or_else(|| package.type_aliases.get(&local))?;
+        // SAFETY: as above — a package's member maps only hold compile-time
+        // declaration pointers, allocated alongside the package.
+        #[expect(unsafe_code, reason = "deref a compile-time declaration pointer")]
+        let object = unsafe { ptr.get() };
+        Some(bex_vm_types::TypeHead::new(
+            ptr,
+            object.declared_type_tag()?,
+        ))
     }
 
     /// Every loaded package's `Object::Package` pointer.
@@ -262,7 +320,7 @@ pub fn lookup_type_by_fqn(packages: &PackageIndex, fqn: &str) -> Option<HeapPtr>
 /// rendering), reconstructing each qualified name from its package + `LocalName`.
 pub fn all_recursive_type_aliases(
     packages: &PackageIndex,
-) -> IndexMap<baml_type::TypeName, baml_type::RealizedTy> {
+) -> IndexMap<baml_type::TypeName, bex_vm_types::RealizedTy> {
     let mut out = IndexMap::new();
     for (pkg_name, pkg_ptr) in packages.iter() {
         // SAFETY: `packages` only ever holds compile-time `Object::Package`
@@ -300,6 +358,72 @@ pub fn build_heap_with_packages(
 ) -> (Arc<BexHeap>, PackageIndex) {
     let layout = reserve_package_slots(&mut compile_time_objects, packages);
     let mut heap = BexHeap::build_unsealed_default(compile_time_objects);
-    let index = fill_package_slots(&mut heap, packages, &layout);
+    let mut index = fill_package_slots(&mut heap, packages, &layout);
+    index.by_tag = resolve_type_heads(&mut heap);
     (heap.seal(), index)
+}
+
+/// Bind every [`TypeHead`](bex_vm_types::TypeHead) in the compile-time region to
+/// the declaration it names.
+///
+/// Emit mints heads *unresolved*: a head's identity is its content-addressed
+/// tag, which needs no heap, but its pointer — the access path the runtime
+/// dereferences instead of doing a package lookup — can only be filled once the
+/// objects have addresses. That is here, after the pool is laid out and before
+/// the heap is sealed.
+///
+/// The walk itself is generated (`visit_heads_mut`), so a head-bearing position
+/// added to the type family later is covered without touching this function.
+/// What is *not* generated is the list of object fields below — that is the
+/// residual risk, and why the pass ends by asserting nothing was missed.
+fn resolve_type_heads(
+    heap: &mut BexHeap,
+) -> std::collections::HashMap<baml_type::typetag::TypeTag, HeapPtr> {
+    use bex_vm_types::typetag_index::{TagIndex, visit_object_heads_mut};
+
+    let index = TagIndex::of_compile_time(heap);
+    for slot in 0..heap.compile_time_len() {
+        let mut object =
+            std::mem::replace(heap.compile_time_object_mut(slot), Object::Float(f64::NAN));
+        visit_object_heads_mut(&mut object, &mut |head| {
+            if let Some(ptr) = index.get(head.tag()) {
+                head.resolve(ptr);
+            }
+        });
+        heap.set_compile_time_object(slot, object);
+    }
+
+    // Every head whose declaration this program *carries* must now be bound: a
+    // head the walk missed would fail on its first dereference, far from the
+    // cause. That is the property worth asserting, and the one most likely to
+    // break — the per-object field list in `visit_object_heads_mut` is
+    // hand-maintained, unlike the walk within each type.
+    //
+    // A head naming a declaration the pool does *not* carry stays unresolved.
+    // That is reachable today: a synthetic `*$stream` alias companion can be
+    // referenced by a class field without itself being pooled, so the reference
+    // survives with nothing to point at. Dereferencing one is a null read, and
+    // closing that gap is emit-side work — pool every alias a surviving
+    // `Ty::TypeAlias` names.
+    #[cfg(debug_assertions)]
+    {
+        let mut missed = Vec::new();
+        for slot in 0..heap.compile_time_len() {
+            let mut object =
+                std::mem::replace(heap.compile_time_object_mut(slot), Object::Float(f64::NAN));
+            visit_object_heads_mut(&mut object, &mut |head| {
+                if !head.is_resolved() && index.get(head.tag()).is_some() {
+                    missed.push((slot, head.tag().as_i64()));
+                }
+            });
+            heap.set_compile_time_object(slot, object);
+        }
+        assert!(
+            missed.is_empty(),
+            "load left resolvable type heads unbound (object, tag): {missed:?}; \
+             `visit_object_heads_mut` is missing an object field",
+        );
+    }
+
+    index.into_map()
 }

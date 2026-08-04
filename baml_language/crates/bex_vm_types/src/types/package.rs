@@ -1,9 +1,8 @@
 use baml_base::Name;
-use baml_type::TyTemplate;
 use borsh::{BorshDeserialize, BorshSerialize};
 use indexmap::IndexMap;
 
-use crate::{HeapPtr, ObjectIndex, types::interface::InterfaceBound};
+use crate::{HeapPtr, ObjectIndex, TyTemplate, types::interface::InterfaceBound};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
 pub struct LocalName {

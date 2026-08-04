@@ -466,46 +466,47 @@ pub struct NoFacts;
     reason = "naming `NoFacts` to define its own trait impl fires the lint; this is \
               the type's definition, not a consumer site to migrate off it"
 )]
-impl TypeContext for NoFacts {
-    /// The identity, like every name-based context: naming a declaration is not
-    /// a *fact* about it, so this is answerable even here. Returning `None`
+impl<H: Head + crate::HeadFromName> TypeContext<H> for NoFacts {
+    /// Minting the head, like every name-based context: naming a declaration is
+    /// not a *fact* about it, so this is answerable even here. Returning `None`
     /// would silently disable the `AnyFunction` covariance rule, which used to
-    /// fire under this context on the name alone.
-    fn head_lookup(&self, qtn: &QualifiedTypeName) -> Option<QualifiedTypeName> {
-        Some(qtn.clone())
+    /// fire under this context on the name alone — which is why this is a
+    /// `HeadFromName` bound rather than a `None`.
+    fn head_lookup(&self, qtn: &QualifiedTypeName) -> Option<H> {
+        Some(H::head_from_name(qtn))
     }
 
-    fn alias_def(&self, _name: &QualifiedTypeName) -> Option<Ty> {
+    fn alias_def(&self, _name: &H) -> Option<Ty<H>> {
         None
     }
 
-    fn implements_interface(&self, _concrete: &Ty, _interface: &Interface) -> bool {
+    fn implements_interface(&self, _concrete: &Ty<H>, _interface: &Interface<H>) -> bool {
         false
     }
 
-    fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface> {
+    fn type_var_bound(&self, _param: &ParamTy) -> Vec<Interface<H>> {
         Vec::new()
     }
 
-    fn interface_requires(&self, _sub: &Interface, _sup: &Interface) -> bool {
+    fn interface_requires(&self, _sub: &Interface<H>, _sup: &Interface<H>) -> bool {
         false
     }
 
-    fn enum_variants(&self, _name: &QualifiedTypeName) -> Option<Vec<Name>> {
+    fn enum_variants(&self, _name: &H) -> Option<Vec<Name>> {
         None
     }
 
-    fn associated_type_bound(&self, _interface: &Interface, _assoc: Name) -> Vec<Interface> {
+    fn associated_type_bound(&self, _interface: &Interface<H>, _assoc: Name) -> Vec<Interface<H>> {
         Vec::new()
     }
 
     fn project(
         &self,
-        _base: &Ty,
-        _interface: &Interface,
+        _base: &Ty<H>,
+        _interface: &Interface<H>,
         _member: &Name,
         _fuel: u32,
-    ) -> ProjectionStep<QualifiedTypeName> {
+    ) -> ProjectionStep<H> {
         ProjectionStep::Opaque
     }
 }

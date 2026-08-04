@@ -1,7 +1,6 @@
-use baml_type::RuntimeTy;
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::{AtomicValueSlot, CleanupLatch, HeapPtr, Value};
+use crate::{AtomicValueSlot, CleanupLatch, HeapPtr, RuntimeTy, Value};
 
 /// A field within a runtime class, carrying type and schema metadata.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -17,7 +16,7 @@ pub struct ClassField {
     ///
     /// Populated by emit using the enclosing class's `generic_params`.  For
     /// non-generic classes this is a fully-realized template (no `TypeArgRef`).
-    pub field_template: baml_type::TyTemplate,
+    pub field_template: crate::TyTemplate,
     pub description: Option<String>,
     pub alias: Option<String>,
     pub skip: bool,
@@ -81,7 +80,7 @@ pub struct Instance {
     /// Boxed (immutable after construction) rather than a `Vec` so `Instance`
     /// stays within `Object`'s 64-byte budget once the `cleaned` latch is added
     /// — matching the existing `Box<[RuntimeTy]>` convention for type-arg lists.
-    pub class_type_args: Box<[baml_type::RealizedTy]>,
+    pub class_type_args: Box<[crate::RealizedTy]>,
 
     /// Fields are accessed by index. No string lookups. Each slot is atomic so
     /// racing field reads/writes across `spawn` fibers cannot become a Rust
@@ -98,7 +97,7 @@ pub struct Instance {
 impl Instance {
     pub fn new(
         class: HeapPtr,
-        class_type_args: Box<[baml_type::RealizedTy]>,
+        class_type_args: Box<[crate::RealizedTy]>,
         fields: Vec<Value>,
     ) -> Self {
         Self {

@@ -66,21 +66,28 @@ use crate::HeapPtr;
 ///
 /// The cost is that "unresolved" is not distinguishable in the type system, so
 /// a head the loader misses fails on its first dereference. Loading therefore
-/// ends by asserting no unresolved head survives, and `resolve`/`forward_to`
-/// each assert the state they expect, so a double-resolve or a forward of a
-/// never-resolved head is caught where it happens rather than downstream.
-///
-/// # GC obligation
-///
-/// The pointer makes every reachable `TypeHead` a GC edge: it keeps the
-/// declaration alive, must be traced, and must be forwarded after a move. Types
-/// reach heads through arbitrary nesting, so the walk is generated rather than
-/// hand-written — see `visit_heads` / `visit_heads_mut` on every family member.
+/// ends by asserting no unresolved head survives, and [`resolve`](Self::resolve)
+/// asserts it has not already run, so a double-resolve is caught where it
+/// happens rather than downstream.
 ///
 /// A missed head is a dangling pointer, but note what it is *not*: identity
 /// keeps working, because comparison never reads the pointer. So the failure
 /// surfaces on the next dereference, not as types mysteriously comparing
 /// unequal.
+///
+/// # Why the collector ignores heads
+///
+/// A pointer into the heap is normally a GC edge — traced to keep its target
+/// alive, and repointed when the target moves. A head is neither, because every
+/// declaration it can name lives in the heap's compile-time region, which is
+/// allocated once at load and then never moved and never collected. So there is
+/// nothing to keep alive and no address to update.
+///
+/// What the walk (`visit_heads` / `visit_heads_mut`, generated on every family
+/// member because types reach heads through arbitrary nesting) exists for is
+/// *load*: binding each head to the declaration it names. If declarations ever
+/// become movable, that walk is the hook — but a repointing operation does not
+/// exist today, and should not be added speculatively.
 #[derive(Clone, Copy, Debug)]
 pub struct TypeHead {
     ptr: HeapPtr,
@@ -161,6 +168,28 @@ impl TypeHead {
         }
     }
 
+    /// This head's compact display name, for messages.
+    ///
+    /// Mirrors [`TypeName::display_name`](baml_type::TypeName::display_name) so
+    /// a site that renders a head reads the same at either spelling. Identity
+    /// comparisons must not go through here — compare [`tag`](Self::tag).
+    #[must_use]
+    pub fn display_name(self) -> String {
+        baml_type::HeadDisplay::head_display_name(&self)
+    }
+
+    /// Whether this head names a type in a panic namespace.
+    ///
+    /// Mirrors [`TypeName::is_panic_type`](baml_type::TypeName::is_panic_type),
+    /// reading through the declaration. An unresolved head answers `false`: it
+    /// cannot be shown to be a panic type, and the caller's fail-safe direction
+    /// is to treat it as an ordinary error.
+    #[must_use]
+    pub fn is_panic_type(self) -> bool {
+        self.declared_name()
+            .is_some_and(|name| name.is_panic_type())
+    }
+
     /// Whether the pointer cache has been filled — false for a head straight out
     /// of emit or a decoder, true once the loader has bound it.
     #[must_use]
@@ -182,11 +211,13 @@ impl TypeHead {
         self.ptr = definition;
     }
 
-    /// Where the declaration lives — for dereferencing it, and for the collector
-    /// to trace. Not an identity; compare [`tag`](Self::tag) instead.
+    /// Where the declaration lives, for dereferencing it. Not an identity;
+    /// compare [`tag`](Self::tag) instead.
     ///
     /// Null until [`resolve`](Self::resolve) has run; see
-    /// [`is_resolved`](Self::is_resolved).
+    /// [`is_resolved`](Self::is_resolved). Nothing repoints a bound head: every
+    /// declaration lives in the heap's compile-time region, which is never moved
+    /// and never collected, so this address is stable for the heap's lifetime.
     #[must_use]
     pub fn ptr(self) -> HeapPtr {
         self.ptr
@@ -196,18 +227,6 @@ impl TypeHead {
     #[must_use]
     pub fn tag(self) -> TypeTag {
         self.tag
-    }
-
-    /// Repoint this head after the collector has moved its declaration.
-    ///
-    /// Identity is untouched: a moved head remains equal to, and hashes and
-    /// orders with, every other reference to the same declaration.
-    pub fn forward_to(&mut self, moved: HeapPtr) {
-        debug_assert!(
-            self.is_resolved(),
-            "forwarding an unresolved head: the collector reached a head the loader never bound",
-        );
-        self.ptr = moved;
     }
 }
 
@@ -239,6 +258,23 @@ impl baml_type::HeadDisplay for TypeHead {
             crate::Object::TypeAlias(alias) => alias.name.display_name().to_string(),
             _ => format!("<type #{}>", self.tag.as_i64()),
         }
+    }
+}
+
+/// A runtime head is derivable from a name because a declared head's tag is
+/// content-addressed — see [`TypeHead::of_name`]. The head it yields is
+/// unresolved, which is what callers of this trait want: they compare it.
+impl baml_type::HeadFromName for TypeHead {
+    fn head_from_name(qtn: &baml_type::QualifiedTypeName) -> Self {
+        Self::of_name(qtn)
+    }
+}
+
+/// A head displays as the declaration it names, so a `{head}` in a message reads
+/// the same as the `TypeName` it replaced.
+impl std::fmt::Display for TypeHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&baml_type::HeadDisplay::head_display_name(self))
     }
 }
 
@@ -363,12 +399,12 @@ mod tests {
         }
     }
 
-    /// The property the collector depends on: moving a declaration changes its
-    /// address but nothing observable. Comparison never consults the pointer, so
-    /// a head is correct whether or not it has been forwarded yet — only
-    /// dereferencing needs the new address.
+    /// The pointer is a cache, not identity: two heads with the same tag and
+    /// different pointers are the same head, and agree on hash and order. This
+    /// is what lets a serialized head come back cold (null) and still compare
+    /// equal to the loaded one.
     #[test]
-    fn forwarding_leaves_identity_untouched() {
+    fn pointer_is_not_identity() {
         use std::{
             collections::hash_map::DefaultHasher,
             hash::{Hash, Hasher},
@@ -380,22 +416,22 @@ mod tests {
             hasher.finish()
         };
 
-        let (mut from_space, mut to_space, mut other) = (slot(), slot(), slot());
-        let before = head(&mut from_space, 500);
+        let (mut here, mut there, mut other) = (slot(), slot(), slot());
+        let resolved = head(&mut here, 500);
         let ordering_peer = head(&mut other, 900);
-        let (hash_before, was_less) = (hash_of(&before), before < ordering_peer);
 
-        let mut after = before;
-        after.forward_to(ptr_to(&mut to_space));
+        let elsewhere = head(&mut there, 500);
+        let cold = TypeHead::unresolved(resolved.tag());
 
-        assert_eq!(after, before, "a moved head is still the same head");
-        assert_eq!(after.tag(), before.tag());
-        assert_eq!(hash_of(&after), hash_before, "hash must survive a move");
-        assert_eq!(after < ordering_peer, was_less, "order must survive a move");
+        for peer in [elsewhere, cold] {
+            assert_eq!(peer, resolved, "same tag is the same head");
+            assert_eq!(hash_of(&peer), hash_of(&resolved));
+            assert_eq!(peer < ordering_peer, resolved < ordering_peer);
+        }
         assert_ne!(
-            after.ptr(),
-            before.ptr(),
-            "only the access path changed, and it is not identity",
+            elsewhere.ptr(),
+            resolved.ptr(),
+            "only the access path differs, and it is not identity",
         );
     }
 
@@ -473,6 +509,54 @@ mod tests {
             TyAttr::default(),
         );
         assert_eq!(ty.to_string(), "demo.Person[]");
+    }
+
+    /// The two conversion directions compose to the identity: a compiled type
+    /// anchored onto heads, then named again, is the type it started as.
+    ///
+    /// This is the contract the whole migration rests on — emit anchors, the
+    /// loader resolves, and any boundary out of the VM names again, so a type
+    /// must survive the round trip with nothing lost. The asymmetry is pinned
+    /// too: anchoring is total, while naming an unresolved head fails rather
+    /// than inventing one.
+    #[test]
+    fn anchoring_and_naming_round_trip() {
+        use baml_type::{RuntimeTy, TyAttr};
+
+        let person = baml_type::TypeName::new(
+            baml_base::Name::new("demo"),
+            vec![],
+            baml_base::Name::new("Person"),
+        );
+        let mut declaration = crate::Object::Class(Box::new(crate::types::Class {
+            name: person.clone(),
+            fields: vec![],
+            description: None,
+            alias: None,
+            type_tag: TypeTag::of_head(&person.render_dotted(false)),
+            ty_attr: TyAttr::default(),
+            has_cleanup: false,
+            generic_param_count: 0,
+        }));
+
+        // A head nested behind a container and inside a generic argument list.
+        let compiled: RuntimeTy = RuntimeTy::list(RuntimeTy::Class(
+            person.clone(),
+            vec![RuntimeTy::int()],
+            TyAttr::default(),
+        ));
+
+        // What emit writes at a construction site: pure, no heap, no lookup.
+        let mut anchored = compiled.map_heads(&mut TypeHead::of_name);
+        assert_eq!(
+            crate::name_headed(&anchored),
+            Err(crate::UnnameableHead(TypeHead::of_name(&person).tag())),
+            "an unresolved head has no name to give",
+        );
+
+        // The loader binds every head the walk reaches.
+        anchored.visit_heads_mut(&mut |head| head.resolve(ptr_to(&mut declaration)));
+        assert_eq!(crate::name_headed(&anchored), Ok(compiled));
     }
 
     /// Dynamic tags are disjoint from every content-addressed one, so a
