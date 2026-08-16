@@ -1303,8 +1303,9 @@ fn walk_ty(
 
 #[cfg(test)]
 mod tests {
-    use baml_type::{Freshness, TyAttr, TypeName};
     use std::sync::Arc;
+
+    use baml_type::{Freshness, TyAttr, TypeName};
 
     use super::*;
 
