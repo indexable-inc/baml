@@ -67,34 +67,118 @@ env:
   # windows job.
   CARGO_PROFILE_DEV_OPT_LEVEL: "1"
   CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+  # Workflow-level mirror of the runner image's CARGO_BUILD_JOBS pin: cargo
+  # defaults -j to the guest's full 64 cores, and every concurrent pool member
+  # doing that oversubscribes the host it shares (measured: the same cold
+  # build was 317s at full-wave contention vs 120s alone). The image pin only
+  # reaches VMs at the next pool roll; this makes it effective now and is a
+  # no-op once the roll lands. Hosted fallback runners have <=16 vCPUs, so
+  # this changes nothing there.
+  CARGO_BUILD_JOBS: "16"
+  # Workflow-level so it is deterministic on EVERY run regardless of which
+  # image generation the pool member carries (workflow env overrides the
+  # runner unit env; the image pin only reaches VMs at a pool roll, and a
+  # roll cannot converge while CI keeps the members busy). vitest sizes its
+  # pool off availableParallelism()-1 = 63 on the 64-vCPU guests and
+  # vitest-pool-workers spawns one workerd per worker; the elastic guest can
+  # hold ~6 GiB when the spawn burst lands, so the kernel OOM-kills workerd
+  # ("Worker exited unexpectedly"). Measured on the pool: 63 and 16 workers
+  # fail 2/2 (cgroup oom_kill increments), 4 passes 2/2. Pairs with the
+  # one-pool-at-a-time nextest group in baml_language/.config/nextest.toml.
+  VITEST_MAX_WORKERS: "4"
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
 
   cargo-test-linux:
     name: "cargo test (x86_64-unknown-linux-gnu)"
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 25
+    # Fork PRs must never run on the persistent ix pool: the VMs are reused by
+    # later trusted, secret-bearing jobs. Untrusted events fall back to the
+    # GitHub-hosted runner this job used before the pool migration.
+    runs-on: ${{ (((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "ix-gnu"]')) || 'blacksmith-16vcpu-ubuntu-2404' }}
+    # 40, not 25: on the persistent pool a run that misses its warm member
+    # recompiles from local sccache and has been measured at 1519s+ under
+    # family contention (cancelled at the old 25m cap); warm runs are 92s.
+    # The cap is a hang backstop, not a perf gate - the L2 conversion of this
+    # lane (nextest binaries-metadata export) is what removes the recompiles.
+    timeout-minutes: 40
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
-      - name: "Install Rust toolchain"
-        run: rustup show
-        working-directory: baml_language
-
-      # mise installs sccache/direnv AND cargo-nextest (cargo: backend ->
-      # cargo-binstall prebuilt), replacing taiki-e/install-action.
-      - name: "Install tools (mise)"
-        uses: ./.github/actions/setup-mise
+      # nix arm: the flake CI shell provides the pinned toolchain, sccache,
+      # direnv and cargo-nextest. Fallback arm (no nix): rustup + mise.
+      - name: "Set up toolchains"
+        id: toolchains
+        uses: ./.github/actions/setup-ci-shell
         with:
-          install_args: "sccache direnv cargo:cargo-nextest"
+          mise-install-args: "sccache direnv cargo:cargo-nextest"
 
       - name: "Verify sccache"
         run: sccache --version
 
+      # Same probe as the msrv, wasm and musl lanes, same shape on purpose
+      # (two probes in one file reading differently is how one of them
+      # rots); the full why-a-probe-not-a-switch reasoning lives above the
+      # msrv probe. The root is the gnu nextest EXPORT: manifests whose
+      # interpolated store paths pin every test binary into one closure, so
+      # a hit substitutes the compile work and the job only RUNS the tests,
+      # in this runner environment on both arms.
+      - name: "Probe the L2 unit cache"
+        id: l2
+        if: steps.toolchains.outputs.nix == 'true'
+        env:
+          # The eval runs the render IFD, so it is not free; bound it rather
+          # than let a cold guest sit here. The network probe is the cheap
+          # half and gets a tight budget of its own.
+          L2_EVAL_TIMEOUT_SECONDS: "180"
+          L2_PROBE_TIMEOUT_SECONDS: "10"
+        run: |
+          set -uo pipefail
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+
+          # Timeout (rc 124) is a slow cold guest and expected; any other
+          # nonzero exit is a broken flake and must not hide behind a green
+          # cargo arm. Keep stderr: on the error arm it is the only place
+          # the nix diagnostic survives.
+          eval_log="$(mktemp)"
+          out_path="$(timeout "${L2_EVAL_TIMEOUT_SECONDS}" nix eval --raw .#gnu-test-export.outPath 2>"${eval_log}")" \
+            && eval_rc=0 || eval_rc=$?
+          if [ "${eval_rc}" -ne 0 ]; then
+            if [ "${eval_rc}" -eq 124 ]; then
+              echo "::notice title=L2::evaluation did not finish within ${L2_EVAL_TIMEOUT_SECONDS}s; taking the cargo arm"
+            else
+              echo "::warning title=L2::evaluation FAILED with exit ${eval_rc} (not a timeout); taking the cargo arm"
+              sed -n '1,25p' "${eval_log}"
+            fi
+            exit 0
+          fi
+
+          # Local first: runners are persistent, so a VM that already built
+          # this exact root has it on disk.
+          if nix path-info "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::already in the local store: ${out_path}; taking the nix arm"
+          # --narinfo-cache-negative-ttl 0: a probe that runs before the
+          # builder publishes must not poison this runner for an hour.
+          elif timeout "${L2_PROBE_TIMEOUT_SECONDS}" nix path-info --narinfo-cache-negative-ttl 0 --store https://cache.ix.dev "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::cache hit for ${out_path}; taking the nix arm"
+          else
+            echo "::notice title=L2::cache miss for ${out_path}; taking the cargo arm"
+          fi
+
       - uses: Swatinem/rust-cache@v2
+        # Deliberately ungated by the probe: the cargo arm stays the
+        # fallback, so its cache has to keep being warmed on canary or the
+        # first L2 miss lands on a cold cargo build.
         with:
           workspaces: "baml_language -> target"
           cache-all-crates: true
@@ -111,6 +195,7 @@ jobs:
 
       # Separate step so if fetch is slow, build is fast.
       - name: "Fetch cargo dependencies"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo fetch
         working-directory: baml_language
 
@@ -122,11 +207,36 @@ jobs:
       # too.) The `sdk_test_*` crates need uv and run in the dedicated
       # `sdk-tests` matrix below.
       - name: "Build tests with --timings"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo test --no-run --all-features --timings --workspace --exclude baml_tests --exclude baml_cli --exclude baml_lsp2_actions --exclude "sdk_test_*" --exclude baml_bridge
         working-directory: baml_language
 
+      # The nix arm: substitute the export (manifests + every test binary in
+      # its closure), then run nextest against the prebuilt binaries in THIS
+      # checkout. --workspace-remap makes nextest derive each test's cwd
+      # from the real tree; INSTA_WORKSPACE_ROOT is insta's hatch for
+      # relocated builds (this lane runs baml_surface's insta tests). The
+      # list phase executes each binary once; these are glibc binaries
+      # linking the graph's openssl with no rpath, and the loader finds it
+      # through the LD_LIBRARY_PATH ci-env already exports (the export's
+      # linked-paths synthesis is empty in v1).
+      - name: "Run tests with nextest (nix unit graph)"
+        if: steps.l2.outputs.hit == 'true'
+        run: |
+          set -euo pipefail
+          echo "::notice title=L2::arm=nix"
+          export_dir="$(nix build --no-link --print-out-paths --print-build-logs .#gnu-test-export)"
+          cd baml_language
+          INSTA_WORKSPACE_ROOT="$PWD" cargo nextest run \
+            --binaries-metadata "$export_dir/binaries-metadata.json" \
+            --cargo-metadata "$export_dir/cargo-metadata.json" \
+            --workspace-remap "$PWD"
+
       - name: "Run tests with nextest"
-        run: cargo nextest run --all-features --workspace --exclude baml_tests --exclude baml_cli --exclude baml_lsp2_actions --exclude "sdk_test_*" --exclude baml_bridge
+        if: steps.l2.outputs.hit != 'true'
+        run: |
+          echo "::notice title=L2::arm=cargo"
+          cargo nextest run --all-features --workspace --exclude baml_tests --exclude baml_cli --exclude baml_lsp2_actions --exclude "sdk_test_*" --exclude baml_bridge
         working-directory: baml_language
 
       - name: "Upload test results on failure"
@@ -154,12 +264,16 @@ jobs:
           path: sccache-stats-test-linux.json
           if-no-files-found: ignore
 
+      # --timings only exists on the cargo arm; `clean: false` keeps stale
+      # files across runs, so an unconditional mv would fail on the nix arm
+      # or ship the previous run's timings as this run's (same gating as
+      # the msrv job).
       - name: "Rename cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         run: mv target/cargo-timings/cargo-timing.html target/cargo-timings/cargo-timing-test-linux.html
         working-directory: baml_language
       - name: "Upload cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: cargo-timings-test-linux
@@ -168,36 +282,104 @@ jobs:
 
   cargo-test-linux-musl:
     name: "cargo test (x86_64-unknown-linux-musl)"
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 35
+    runs-on: ${{ (((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "ix-musl"]')) || 'blacksmith-16vcpu-ubuntu-2404' }}
+    # 45, not 35: same reasoning as the gnu lane above; measured 1400s under
+    # contention against the old 35m cap (23 of 35 minutes used).
+    timeout-minutes: 45
     env:
       CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
-      - name: "Install Rust toolchain"
-        run: |
-          set -euo pipefail
-          rustup show
-          rustup target add x86_64-unknown-linux-musl
+      # nix arm: the CI shell's toolchain already carries the musl target
+      # (rust-toolchain.toml) and ships a static-PIE-capable musl-gcc.
+      - name: "Set up toolchains"
+        id: toolchains
+        uses: ./.github/actions/setup-ci-shell
+        with:
+          mise-install-args: "sccache direnv cargo:cargo-nextest"
+
+      - name: "Add the musl target (no-nix fallback)"
+        if: steps.toolchains.outputs.nix == 'false'
+        run: rustup target add x86_64-unknown-linux-musl
         working-directory: baml_language
 
+      # Both arms: this wires CC_<target> + CARGO_TARGET_*_LINKER=musl-gcc,
+      # without which cargo links the musl target with the default (glibc)
+      # gcc and dies on `-ldl` (musl folds libdl into libc). The CI shell
+      # provides musl-gcc, so the action's apt branch never runs on ix.
       - name: "Setup musl cross toolchain"
         uses: ./.github/actions/setup-musl-cross
         with:
           target: x86_64-unknown-linux-musl
 
-      - name: "Install tools (mise)"
-        uses: ./.github/actions/setup-mise
-        with:
-          install_args: "sccache direnv cargo:cargo-nextest"
-
       - name: "Verify sccache"
         run: sccache --version
 
+      # Same probe as the msrv and wasm lanes, same shape on purpose (two
+      # probes in one file reading differently is how one of them rots); the
+      # full why-a-probe-not-a-switch reasoning lives above the msrv probe.
+      # The root here is the nextest EXPORT: two JSON manifests whose
+      # interpolated store paths pin every musl test binary into one
+      # closure, so a hit substitutes the compile work and the job only
+      # RUNS the tests. The tests execute in this runner environment on
+      # both arms - the arm changes who compiled, never what runs where.
+      - name: "Probe the L2 unit cache"
+        id: l2
+        if: steps.toolchains.outputs.nix == 'true'
+        env:
+          # The eval runs the render IFD, so it is not free; bound it rather
+          # than let a cold guest sit here. The network probe is the cheap
+          # half and gets a tight budget of its own.
+          L2_EVAL_TIMEOUT_SECONDS: "180"
+          L2_PROBE_TIMEOUT_SECONDS: "10"
+        run: |
+          set -uo pipefail
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+
+          # Timeout (rc 124) is a slow cold guest and expected; any other
+          # nonzero exit is a broken flake and must not hide behind a green
+          # cargo arm. Keep stderr: on the error arm it is the only place
+          # the nix diagnostic survives.
+          eval_log="$(mktemp)"
+          out_path="$(timeout "${L2_EVAL_TIMEOUT_SECONDS}" nix eval --raw .#musl-test-export.outPath 2>"${eval_log}")" \
+            && eval_rc=0 || eval_rc=$?
+          if [ "${eval_rc}" -ne 0 ]; then
+            if [ "${eval_rc}" -eq 124 ]; then
+              echo "::notice title=L2::evaluation did not finish within ${L2_EVAL_TIMEOUT_SECONDS}s; taking the cargo arm"
+            else
+              echo "::warning title=L2::evaluation FAILED with exit ${eval_rc} (not a timeout); taking the cargo arm"
+              sed -n '1,25p' "${eval_log}"
+            fi
+            exit 0
+          fi
+
+          # Local first: runners are persistent, so a VM that already built
+          # this exact root has it on disk.
+          if nix path-info "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::already in the local store: ${out_path}; taking the nix arm"
+          # --narinfo-cache-negative-ttl 0: a probe that runs before the
+          # builder publishes must not poison this runner for an hour.
+          elif timeout "${L2_PROBE_TIMEOUT_SECONDS}" nix path-info --narinfo-cache-negative-ttl 0 --store https://cache.ix.dev "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::cache hit for ${out_path}; taking the nix arm"
+          else
+            echo "::notice title=L2::cache miss for ${out_path}; taking the cargo arm"
+          fi
+
       - uses: Swatinem/rust-cache@v2
+        # Deliberately ungated by the probe: the cargo arm stays the
+        # fallback, so its cache has to keep being warmed on canary or the
+        # first L2 miss lands on a cold cargo build.
         with:
           workspaces: "baml_language -> target"
           cache-all-crates: true
@@ -213,6 +395,7 @@ jobs:
           direnv export gha >> "$GITHUB_ENV"
 
       - name: "Fetch cargo dependencies"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo fetch
         working-directory: baml_language
 
@@ -220,13 +403,48 @@ jobs:
       # needs a separate target-specific OpenSSL build. Default features match
       # the rustls-based musl artifacts we ship.
       - name: "Build tests with --timings"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo test --no-run --timings --workspace --exclude baml_tests --exclude "sdk_test_*" --exclude baml_bridge
         working-directory: baml_language
 
+      # The nix arm: substitute the export (manifests + every test binary in
+      # its closure), then run nextest against the prebuilt binaries in THIS
+      # checkout. --workspace-remap makes nextest derive each test's cwd
+      # from the real tree, so fixtures and runtime CARGO_MANIFEST_DIR reads
+      # resolve here; INSTA_WORKSPACE_ROOT is insta's own hatch for
+      # relocated builds (snapshot dirs are compile-time baked to the
+      # unit's /build placeholder). The list phase executes each binary
+      # once - static musl binaries, no loader env needed.
+      - name: "Run tests with nextest (nix unit graph)"
+        if: steps.l2.outputs.hit == 'true'
+        run: |
+          set -euo pipefail
+          echo "::notice title=L2::arm=nix"
+          # baml_cli's tests bake CARGO_TARGET_TMPDIR as a compile-time
+          # literal (/tmp/baml-cli-target-tmp, see graphPackageBuildEnv) and
+          # WRITE there at run time. Per-slot /tmp sandboxing means the dir
+          # is not guaranteed to exist; if this mkdir fails it is the known
+          # ix-runners /tmp class - let it fail the job loudly, never mask.
+          mkdir -p /tmp/baml-cli-target-tmp
+          export_dir="$(nix build --no-link --print-out-paths --print-build-logs .#musl-test-export)"
+          cd baml_language
+          INSTA_WORKSPACE_ROOT="$PWD" cargo nextest run \
+            --binaries-metadata "$export_dir/binaries-metadata.json" \
+            --cargo-metadata "$export_dir/cargo-metadata.json" \
+            --workspace-remap "$PWD" \
+            -E 'not binary(=pack_e2e)'
+
       - name: "Run tests with nextest"
-        run: cargo nextest run --workspace --exclude baml_tests --exclude "sdk_test_*" --exclude baml_bridge -E 'not binary(=pack_e2e)'
+        if: steps.l2.outputs.hit != 'true'
+        run: |
+          echo "::notice title=L2::arm=cargo"
+          cargo nextest run --workspace --exclude baml_tests --exclude "sdk_test_*" --exclude baml_bridge -E 'not binary(=pack_e2e)'
         working-directory: baml_language
 
+      # Unconditional on BOTH arms: pack_e2e needs baml-pack-host as a
+      # sibling of the baml-cli binary in a writable directory, which a
+      # read-only store path structurally cannot be. One test, kept on the
+      # cargo path; the nix arm pays this one compile.
       - name: "Run pack end-to-end tests"
         run: cargo test -p baml_cli --test pack_e2e
         working-directory: baml_language
@@ -256,13 +474,17 @@ jobs:
           path: sccache-stats-test-linux-musl.json
           if-no-files-found: ignore
 
+      # --timings only exists on the cargo arm; `clean: false` keeps stale
+      # files across runs, so an unconditional mv would fail on the nix arm
+      # or ship the previous run's timings as this run's (same gating as
+      # the msrv job).
       - name: "Rename cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         run: mv target/cargo-timings/cargo-timing.html target/cargo-timings/cargo-timing-test-linux-musl.html
         working-directory: baml_language
 
       - name: "Upload cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: cargo-timings-test-linux-musl
@@ -359,7 +581,8 @@ jobs:
     name: "cargo test (x86_64-pc-windows-msvc)"
     # Skip in the merge queue: windows already ran on the PR. The merge_group
     # event is inherited from ci.yaml through the workflow_call boundary.
-    if: ${{ github.event_name != 'merge_group' }}
+    # Also skip outside the upstream repo (no Blacksmith Windows runners).
+    if: ${{ github.event_name != 'merge_group' && github.repository == 'BoundaryML/baml' }}
     # 8-vCPU + CARGO_BUILD_JOBS=16 (2x cores) was the value sweet spot for the
     # native Windows Rust builds (build-caching/04 Exp 7/9).
     runs-on: blacksmith-8vcpu-windows-2025
@@ -382,6 +605,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
       - name: "Install Rust toolchain"
         run: rustup show
@@ -502,6 +730,26 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
+            // Fork PRs must never run on the persistent ix pool: the VMs are
+            // reused by later trusted, secret-bearing jobs. Untrusted events
+            // fall back to the GitHub-hosted runner these jobs used before the
+            // pool migration. Read off `context` rather than interpolated by
+            // the workflow templater, so no event data is spliced into this
+            // script.
+            // Same-repo test, not head.repo.fork: `fork` answers "is the head
+            // repo a fork of anything", which is true for every PR on a fork
+            // of upstream and would route same-repo PRs to runner labels that
+            // do not exist there.
+            const poolOk =
+              (context.eventName !== 'pull_request' && context.eventName !== 'pull_request_target') ||
+              context.payload.pull_request?.head?.repo?.full_name ===
+                `${context.repo.owner}/${context.repo.repo}`;
+            // One constant covers all eight linux SDK entries, so the whole
+            // generated matrix lands in the sdk family: these jobs share the
+            // gnu Rust build underneath and differ only in which language
+            // toolchain each one leaves warm on the member.
+            const LINUX_RUNNER = poolOk ? ["self-hosted", "ix-sdk"] : "blacksmith-16vcpu-ubuntu-2404";
+
             const baseMatrix = [
               {
                 "sdk-label": "go",
@@ -510,7 +758,7 @@ jobs:
                 "sdk-path": "go",
                 "install-args": "sccache direnv go cargo:cargo-nextest",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -521,7 +769,7 @@ jobs:
                 "sdk-path": "python_pydantic2",
                 "install-args": "sccache direnv python uv cargo:cargo-nextest",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -532,7 +780,7 @@ jobs:
                 "sdk-path": "typescript",
                 "install-args": "sccache direnv node npm:pnpm cargo:cargo-nextest",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -543,7 +791,7 @@ jobs:
                 "sdk-path": "typescript_web",
                 "install-args": "sccache direnv node npm:pnpm cargo:cargo-nextest github:rustwasm/wasm-pack",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -559,7 +807,7 @@ jobs:
                 "sdk-path": "cpp",
                 "install-args": "sccache direnv cargo:cargo-nextest",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -570,7 +818,7 @@ jobs:
                 "sdk-path": "csharp",
                 "install-args": "sccache direnv cargo:cargo-nextest",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -581,7 +829,7 @@ jobs:
                 "sdk-path": "rust",
                 "install-args": "sccache direnv cargo:cargo-nextest",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -596,7 +844,7 @@ jobs:
                 "sdk-path": "java",
                 "install-args": "sccache direnv java gradle cargo:cargo-nextest",
                 "os-label": "linux",
-                "runs-on": "blacksmith-16vcpu-ubuntu-2404",
+                "runs-on": LINUX_RUNNER,
                 "rust-cache-key": "linux-cargo",
                 "timeout": 30,
               },
@@ -783,7 +1031,15 @@ jobs:
 
             // TODO(B-1545): Re-enable macOS SDK tests after the SIGABRT flakiness is fixed: https://linear.app/boundaryml2/issue/B-1545/investigate-flakiness-in-cargo-test-aarch64-apple-darwin-ci-job
             const enabledMatrix = baseMatrix.filter((entry) => entry["os-label"] !== "macos");
-            const matrix = context.eventName === "merge_group"
+            // Linux-only in the merge queue (mac/win already ran on the PR)
+            // and on forks (no Blacksmith mac/win runners - jobs would queue
+            // forever). GITHUB_REPOSITORY is always set by Actions and the
+            // compare is case-insensitive, so an absent or differently-cased
+            // payload cannot silently drop the mac/win legs upstream.
+            const linuxOnly =
+              context.eventName === "merge_group" ||
+              process.env.GITHUB_REPOSITORY.toLowerCase() !== "boundaryml/baml";
+            const matrix = linuxOnly
               ? enabledMatrix.filter((entry) => entry["os-label"] === "linux")
               : enabledMatrix;
             const enabledSdkDirs = new Set(enabledMatrix.map((entry) => entry["sdk-dir"]));
@@ -805,6 +1061,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
       - name: "Assert every SDK directory has a matrix entry"
         uses: actions/github-script@v8
@@ -873,6 +1134,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
       - name: "Install Rust toolchain"
         run: rustup show
@@ -1066,17 +1332,31 @@ jobs:
 
   cargo-test-wasm:
     name: "cargo test (wasm32-unknown-unknown)"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ (((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "ix-wasm"]')) || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
-      - name: "Install Rust toolchain"
+      # nix arm: the CI shell's toolchain already carries the wasm32 target
+      # (rust-toolchain.toml), so the stall-prone `rustup target add` download
+      # only exists on the fallback arm.
+      - name: "Set up toolchains"
+        id: toolchains
+        uses: ./.github/actions/setup-ci-shell
+        with:
+          mise-install-args: "sccache direnv"
+
+      - name: "Add the wasm32 target (no-nix fallback)"
+        if: steps.toolchains.outputs.nix == 'false'
         run: |
           set -euo pipefail
-          rustup show
           # `rustup target add wasm32` fetches a small (~20MB) std component that
           # normally installs in seconds. A multi-minute duration means a stalled
           # download (rustup has no idle timeout), which otherwise burns the whole
@@ -1093,15 +1373,103 @@ jobs:
           done
         working-directory: baml_language
 
-      - name: "Install sccache and direnv"
-        uses: ./.github/actions/setup-mise
-        with:
-          install_args: "sccache direnv"
-
       - name: "Verify sccache"
         run: sccache --version
 
+      # L2: same probe-then-choose contract as the msrv lane. Take the
+      # per-unit nix graph only when cache.ix.dev (or this VM's own store)
+      # already has this exact root; a unit-DAG miss costs the whole graph
+      # and must route back to cargo.
+      #
+      # This lane carries one extra precondition the msrv lane does not.
+      # The cargo arm discovers its package set at run time from
+      # `cargo metadata`; the nix arm needs that set at EVALUATION time and
+      # so re-derives it from the manifests. Those two derivations agree
+      # today and are checked to agree on every run, because a silent
+      # divergence would have the nix arm compiling a different set of
+      # crates than the lane is supposed to build -- a green job that gated
+      # nothing. Cheap to check: the list is its own IFD-free derivation.
+      - name: "Probe the L2 unit cache"
+        id: l2
+        if: steps.toolchains.outputs.nix == 'true'
+        env:
+          L2_EVAL_TIMEOUT_SECONDS: "180"
+          L2_PROBE_TIMEOUT_SECONDS: "10"
+        run: |
+          set -uo pipefail
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+
+          if ! list_path="$(nix build --no-link --print-out-paths .#wasm-package-list 2>/dev/null)"; then
+            echo "::notice title=L2::could not build the package list; taking the cargo arm"
+            exit 0
+          fi
+          # mktemp, never a hardcoded /tmp path: the pool's runner unit is
+          # ProtectSystem=strict with a per-slot TMPDIR, so /tmp is not
+          # writable, and mktemp honors TMPDIR and so lands in the slot dir.
+          from_cargo="$(mktemp)"
+          cargo metadata --no-deps --format-version 1 --manifest-path baml_language/Cargo.toml \
+            | jq -r '.packages[] | select(.source==null) | select(if .metadata.ci.wasm_support == null then true else .metadata.ci.wasm_support end) | .name' \
+            | LC_ALL=C sort > "${from_cargo}"
+          if [[ ! -s "${from_cargo}" ]]; then
+            # Not drift: cargo metadata itself produced nothing. Distinguished
+            # from a real mismatch so the warning does not send someone to
+            # edit flake.nix over a transient.
+            echo "::notice title=L2::cargo metadata returned no packages; taking the cargo arm"
+            exit 0
+          fi
+          if [[ "$(cat "${list_path}")" != "$(cat "${from_cargo}")" ]]; then
+            echo "::warning title=L2::the flake's wasm package selection has drifted from cargo metadata; taking the cargo arm. Fix wasmPackages in flake.nix."
+            # comm, not diff: coreutils is on the job PATH, diffutils is not
+            # guaranteed to be.
+            comm -3 "${list_path}" "${from_cargo}" || true
+            exit 0
+          fi
+
+          # Timeout vs broken flake, same distinction and deliberately the
+          # same shape as the msrv probe below -- two probes in one file
+          # reading differently is how one of them rots. `timeout` returns
+          # 124 only when it actually fired, so that is the one code that
+          # means "slow guest"; anything else is an eval bug that would
+          # otherwise hide behind a green lane. Note the assignment form:
+          # `if ! cmd; then rc=$?` would capture the status of `!`, not of
+          # the command.
+          eval_log="$(mktemp)"
+          out_path="$(timeout "${L2_EVAL_TIMEOUT_SECONDS}" nix eval --raw .#wasm-check.outPath 2>"${eval_log}")" \
+            && eval_rc=0 || eval_rc=$?
+          if [ "${eval_rc}" -ne 0 ]; then
+            if [ "${eval_rc}" -eq 124 ]; then
+              echo "::notice title=L2::evaluation did not finish within ${L2_EVAL_TIMEOUT_SECONDS}s; taking the cargo arm"
+            else
+              echo "::warning title=L2::evaluation FAILED with exit ${eval_rc} (not a timeout); taking the cargo arm"
+              sed -n '1,25p' "${eval_log}"
+            fi
+            exit 0
+          fi
+
+          # Local first: runners are persistent, so a VM that already built
+          # this root has it on disk and should not be sent down the cargo
+          # path over a remote cache eviction that costs it nothing.
+          if nix path-info "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::already in the local store: ${out_path}; taking the nix arm"
+          # --narinfo-cache-negative-ttl 0, for the reason spelled out on the
+          # msrv probe: nix caches a MISSING narinfo for 3600s by default, so
+          # one probe that runs before the builder publishes would poison
+          # this member for an hour and no rerun inside that window could
+          # hit. Only "not found" is affected; the positive cache is
+          # untouched.
+          elif timeout "${L2_PROBE_TIMEOUT_SECONDS}" nix path-info --narinfo-cache-negative-ttl 0 --store https://cache.ix.dev "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::cache hit for ${out_path}; taking the nix arm"
+          else
+            echo "::notice title=L2::cache miss for ${out_path}; taking the cargo arm"
+          fi
+
       - uses: Swatinem/rust-cache@v2
+        # Deliberately ungated by the probe: the cargo arm stays the
+        # fallback, so its cache has to keep being warmed on canary or the
+        # first L2 miss lands on a cold cargo build.
         with:
           workspaces: "baml_language -> target"
           cache-all-crates: true
@@ -1118,12 +1486,29 @@ jobs:
 
       # Separate step so if fetch is slow, build is fast.
       - name: "Fetch cargo dependencies"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo fetch --target wasm32-unknown-unknown
         working-directory: baml_language
 
-      - name: "Build for WASM"
+      # The nix arm. Same work as the cargo arm below, expressed as one
+      # derivation per rustc invocation, so the guest compiles only the units
+      # this PR's diff perturbed.
+      - name: "Build for WASM (nix unit graph)"
+        if: steps.l2.outputs.hit == 'true'
         run: |
           set -euo pipefail
+          echo "::notice title=L2::arm=nix"
+          # --no-link: the runner keeps ignored files across checkouts
+          # (`clean: false`) and `result` is not ignored, so a symlink left
+          # in the tree would outlive the job.
+          out_path="$(nix build --no-link --print-out-paths --print-build-logs .#wasm-check)"
+          echo "L2_WASM_OUT=${out_path}" >> "$GITHUB_ENV"
+
+      - name: "Build for WASM"
+        if: steps.l2.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          echo "::notice title=L2::arm=cargo"
           readarray -t wasm_packages < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.source==null) | select(if .metadata.ci.wasm_support == null then true else .metadata.ci.wasm_support end) | .name')
           if [[ ${#wasm_packages[@]} -eq 0 ]]; then
             echo "Error: no WASM packages discovered; cargo metadata or jq may have failed" >&2
@@ -1137,8 +1522,12 @@ jobs:
         working-directory: baml_language
 
       - name: "List WASM artifacts"
-        run: ls -lh target/wasm32-unknown-unknown/release/*.wasm || true
-        working-directory: baml_language
+        run: |
+          if [[ "${{ steps.l2.outputs.hit }}" == "true" ]]; then
+            ls -lh "${L2_WASM_OUT}"/wasm/*.wasm || true
+          else
+            ls -lh baml_language/target/wasm32-unknown-unknown/release/*.wasm || true
+          fi
 
       - name: "Show sccache stats"
         if: always()
@@ -1156,15 +1545,19 @@ jobs:
           path: sccache-stats-test-wasm.json
           if-no-files-found: ignore
 
+      # --timings is a cargo flag, so these only exist on the cargo arm. The
+      # existence guard below is not enough on its own: the runner keeps
+      # ignored files across runs (`clean: false`), so on the nix arm the
+      # file present is the PREVIOUS run's and would ship as this run's.
       - name: "Rename cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         run: |
           if [[ -f target/cargo-timings/cargo-timing.html ]]; then
             mv target/cargo-timings/cargo-timing.html target/cargo-timings/cargo-timing-test-wasm.html
           fi
         working-directory: baml_language
       - name: "Upload cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: cargo-timings-test-wasm
@@ -1176,12 +1569,22 @@ jobs:
 
   cargo-build-msrv:
     name: "cargo build (msrv)"
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 25
+    runs-on: ${{ (((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "ix-msrv"]')) || 'blacksmith-16vcpu-ubuntu-2404' }}
+    # 40 (was 25): the MSRV toolchain is unique to this job, so its first run
+    # on any given pool VM rebuilds with a cold compile cache and measured
+    # 21-25+ min under wave contention (three straight 25-min timeouts on
+    # cold members, 2026-08-15). Warm/steady-state runs are far inside the
+    # old budget; the headroom only exists for cold landings.
+    timeout-minutes: 40
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
       - uses: SebRollen/toml-action@v1.2.0
         id: msrv
@@ -1189,7 +1592,21 @@ jobs:
           file: "baml_language/Cargo.toml"
           field: "workspace.package.rust-version"
 
-      - name: "Install Rust toolchain (MSRV)"
+      # nix arm: devShells.ci-msrv reads the same manifest field at eval time,
+      # so the shell's toolchain and this gate cannot drift. The `+MSRV`
+      # spelling is gone on purpose - the shell's cargo is not a rustup shim;
+      # both arms make the MSRV toolchain the plain `cargo` and the assert
+      # below keeps that honest.
+      - name: "Set up toolchains"
+        id: toolchains
+        uses: ./.github/actions/setup-ci-shell
+        with:
+          shell: ci-msrv
+          rustup: "false"
+          mise-install-args: "sccache direnv"
+
+      - name: "Install Rust toolchain (MSRV, no-nix fallback)"
+        if: steps.toolchains.outputs.nix == 'false'
         env:
           MSRV: ${{ steps.msrv.outputs.value }}
         run: |
@@ -1197,15 +1614,86 @@ jobs:
           rustup default "${MSRV}"
         working-directory: baml_language
 
-      - name: "Install sccache and direnv"
-        uses: ./.github/actions/setup-mise
-        with:
-          install_args: "sccache direnv"
+      - name: "Assert the MSRV toolchain is active"
+        env:
+          MSRV: ${{ steps.msrv.outputs.value }}
+        run: rustc --version | grep -F "${MSRV}"
 
       - name: "Verify sccache"
         run: sccache --version
 
+      # L2: take the per-unit nix graph only when cache.ix.dev already has
+      # this exact root, and fall back to cargo otherwise.
+      #
+      # The asymmetry is why this is a probe and not a switch. An sccache
+      # miss costs one compile. A unit-DAG miss costs the whole graph with
+      # no incremental compilation, one process and one sandbox per rustc
+      # invocation, and no shared target/ - measurably WORSE than the cargo
+      # path, not merely equal to it. So a miss must route back to cargo,
+      # and every failure mode here (eval too slow, cache unreachable, nix
+      # absent on the Blacksmith fork-PR arm) must fail open the same way.
+      #
+      # Probing at all is only possible because the graph is
+      # input-addressed: a floating-CA output has no eval-time path to ask
+      # the cache about.
+      - name: "Probe the L2 unit cache"
+        id: l2
+        if: steps.toolchains.outputs.nix == 'true'
+        env:
+          # The eval runs the render IFD, so it is not free; bound it rather
+          # than let a cold guest sit here. The network probe is the cheap
+          # half and gets a tight budget of its own.
+          L2_EVAL_TIMEOUT_SECONDS: "180"
+          L2_PROBE_TIMEOUT_SECONDS: "10"
+        run: |
+          set -uo pipefail
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+
+          # Both arms fail open to cargo, but they are not the same event and
+          # must not read the same in the log. A timeout is a slow cold guest
+          # and is expected; any other nonzero exit is a broken flake, and
+          # reporting that as "did not finish within Ns" is how an eval bug
+          # hides for weeks behind a green lane. `timeout` returns 124 only
+          # when it actually fired, so that is the one code that means what
+          # the old message claimed. Keep stderr: on the error arm it is the
+          # only place the nix diagnostic survives.
+          eval_log="$(mktemp)"
+          out_path="$(timeout "${L2_EVAL_TIMEOUT_SECONDS}" nix eval --raw .#msrv-check.outPath 2>"${eval_log}")" \
+            && eval_rc=0 || eval_rc=$?
+          if [ "${eval_rc}" -ne 0 ]; then
+            if [ "${eval_rc}" -eq 124 ]; then
+              echo "::notice title=L2::evaluation did not finish within ${L2_EVAL_TIMEOUT_SECONDS}s; taking the cargo arm"
+            else
+              echo "::warning title=L2::evaluation FAILED with exit ${eval_rc} (not a timeout); taking the cargo arm"
+              sed -n '1,25p' "${eval_log}"
+            fi
+            exit 0
+          fi
+
+          # Local first. Runners are persistent, so a VM that already built
+          # this exact root has it on disk; asking only the remote would send
+          # such a job down the cargo path over a cache eviction that costs
+          # it nothing.
+          if nix path-info "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::already in the local store: ${out_path}; taking the nix arm"
+          # --narinfo-cache-negative-ttl 0: nix caches negative narinfo
+          # lookups for 3600s by default, so one probe that runs before the
+          # builder publishes would poison this runner for an hour and no
+          # rerun inside the window could ever hit (measured live). The
+          # positive cache is untouched; only "not found" is never cached.
+          elif timeout "${L2_PROBE_TIMEOUT_SECONDS}" nix path-info --narinfo-cache-negative-ttl 0 --store https://cache.ix.dev "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::cache hit for ${out_path}; taking the nix arm"
+          else
+            echo "::notice title=L2::cache miss for ${out_path}; taking the cargo arm"
+          fi
+
       - uses: Swatinem/rust-cache@v2
+        # Deliberately ungated by the probe: the cargo arm stays the
+        # fallback, so its cache has to keep being warmed on canary or the
+        # first L2 miss lands on a cold cargo build.
         with:
           workspaces: "baml_language -> target"
           cache-all-crates: true
@@ -1222,15 +1710,27 @@ jobs:
 
       # Separate step so if fetch is slow, build is fast.
       - name: "Fetch cargo dependencies"
-        env:
-          MSRV: ${{ steps.msrv.outputs.value }}
-        run: cargo "+${MSRV}" fetch
+        if: steps.l2.outputs.hit != 'true'
+        run: cargo fetch
         working-directory: baml_language
 
+      # The nix arm. Same work as the cargo arm below (`cargo test --no-run
+      # --all-features`), expressed as one derivation per rustc invocation,
+      # so the guest compiles only the units this PR's diff perturbed.
+      - name: "Build with MSRV (nix unit graph)"
+        if: steps.l2.outputs.hit == 'true'
+        run: |
+          echo "::notice title=L2::arm=nix"
+          # --no-link: this checkout is `clean: false`, so a bare build's
+          # ./result symlink survives into the next run as an untracked file.
+          # --print-out-paths keeps the built root in the log for triage.
+          nix build --no-link --print-out-paths --print-build-logs .#msrv-check
+
       - name: "Build with MSRV"
-        env:
-          MSRV: ${{ steps.msrv.outputs.value }}
-        run: cargo "+${MSRV}" test --no-run --all-features --timings
+        if: steps.l2.outputs.hit != 'true'
+        run: |
+          echo "::notice title=L2::arm=cargo"
+          cargo test --no-run --all-features --timings
         working-directory: baml_language
 
       - name: "Show sccache stats"
@@ -1249,12 +1749,16 @@ jobs:
           path: sccache-stats-msrv.json
           if-no-files-found: ignore
 
+      # --timings is a cargo flag, so these only exist on the cargo arm. The
+      # runner keeps ignored files across runs (`clean: false`), so an
+      # unconditional `mv` here would fail the job on the nix arm, or worse,
+      # ship the previous run's timings as this run's.
       - name: "Rename cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         run: mv target/cargo-timings/cargo-timing.html target/cargo-timings/cargo-timing-msrv.html
         working-directory: baml_language
       - name: "Upload cargo timings"
-        if: always()
+        if: always() && steps.l2.outputs.hit != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: cargo-timings-msrv
@@ -1263,21 +1767,22 @@ jobs:
 
   cargo-doc:
     name: "cargo doc"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ (((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "ix-gnu"]')) || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 25
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
-      - name: "Install Rust toolchain"
-        run: rustup show
-        working-directory: baml_language
-
-      - name: "Install sccache and direnv"
-        uses: ./.github/actions/setup-mise
+      - name: "Set up toolchains"
+        uses: ./.github/actions/setup-ci-shell
         with:
-          install_args: "sccache direnv"
+          mise-install-args: "sccache direnv"
 
       - name: "Verify sccache"
         run: sccache --version
@@ -1338,21 +1843,26 @@ jobs:
 
   snapshot-tests:
     name: "snapshot tests"
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 30
+    runs-on: ${{ (((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "ix-gnu"]')) || 'blacksmith-16vcpu-ubuntu-2404' }}
+    # 45, not 30: on the persistent pool this lane runs 7-16 min quiet but has
+    # been measured at 30m+ when two full waves stack on the gnu family
+    # (three timeout-cancels on 2026-08-16, all contention, all green on
+    # rerun). 30m leaves zero headroom for the contended regime.
+    timeout-minutes: 45
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Persistent-runner warmth: keep IGNORED files (target/, node_modules)
+          # across runs; tracked files still hard-reset to the new SHA. A no-op
+          # on ephemeral runners; on the ix pool it is what lets a warm rebuild
+          # skip relinking the world.
+          clean: false
 
-      - name: "Install Rust toolchain"
-        run: rustup show
-        working-directory: baml_language
-
-      - name: "Install tools (mise)"
-        uses: ./.github/actions/setup-mise
+      - name: "Set up toolchains"
+        uses: ./.github/actions/setup-ci-shell
         with:
-          install_args: "sccache direnv python uv cargo:cargo-insta cargo:cargo-nextest"
+          mise-install-args: "sccache direnv python uv cargo:cargo-insta cargo:cargo-nextest"
 
       - name: "Verify sccache"
         run: sccache --version
