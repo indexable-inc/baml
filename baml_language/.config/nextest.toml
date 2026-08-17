@@ -26,9 +26,15 @@ csharp-sdk-fixture = { max-threads = 1 }
 # therefore multiply the process fan-out: N in-flight tests x
 # VITEST_MAX_WORKERS workerd, each ~1 GiB anon under V8 - measured 22
 # resident workerd (~13 GiB RSS + 14 GiB zram) at the moment a CI guest
-# OOM-killed the suite. One vitest pool at a time keeps peak memory equal to
-# one pool, which is what the VITEST_MAX_WORKERS dial actually models.
-vitest-pool-serial = { max-threads = 1 }
+# OOM-killed the suite. max-threads = 1 was the OOM tourniquet for the
+# pre-2026-08-17 platform (idle guests deflated to ~6 GiB, re-inflation lost
+# the race to the spawn burst); the fleet now holds a learned working-set
+# floor per guest, so two pools may overlap - that is what collapses the two
+# big vitest_workers tests (91s + 49s serialized) into max(91s). Peak model:
+# in-flight pools x VITEST_MAX_WORKERS workerd. If the lane OOMs again, drop
+# back to 1 alongside the VITEST_MAX_WORKERS step-down in
+# cargo-tests.reusable.yaml.
+vitest-pool-cap = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'package(=sdk_test_rust)'
@@ -40,7 +46,7 @@ test-group = 'csharp-sdk-fixture'
 
 [[profile.default.overrides]]
 filter = 'package(=sdk_test_typescript_web)'
-test-group = 'vitest-pool-serial'
+test-group = 'vitest-pool-cap'
 
 # Node TypeScript tests build only the native bridge and Node fixture packages.
 [scripts.setup.typescript_pnpm_unix]
