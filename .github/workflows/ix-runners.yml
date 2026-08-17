@@ -95,14 +95,7 @@ jobs:
     # built from this ref, so an unrestricted dispatch would let anyone with
     # write access roll the fleet onto an unreviewed runner config.
     if: github.ref == 'refs/heads/canary'
-    # TEMPORARY (revert me): GitHub-hosted runners are unavailable while the
-    # org's Actions billing is locked, so the reconcile runs on a dedicated
-    # self-hosted ix VM (baml-reconcile-1, booted manually from this repo's
-    # own pool template). This weakens the "IX_TOKEN never reaches a
-    # self-hosted VM" isolation for the duration - acceptable while all
-    # same-repo authors are trusted, wrong as a steady state. When billing
-    # works again: revert this commit and delete baml-reconcile-1.
-    runs-on: [self-hosted, ix]
+    runs-on: ubuntu-latest
     # Worst case is a cold bootstrap: 32 creates at bounded concurrency, and
     # a create wave can take ~30 min.
     timeout-minutes: 180
