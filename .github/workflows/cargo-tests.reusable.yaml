@@ -2099,6 +2099,13 @@ jobs:
     # (three timeout-cancels on 2026-08-16, all contention, all green on
     # rerun). 30m leaves zero headroom for the contended regime.
     timeout-minutes: 45
+    env:
+      # Mirrored in the snapshot unit graph (flake.nix snapshotWorkspace) so
+      # both arms of the L2 lane compile the same program shape - the
+      # gnu/musl rule. These binaries RUN, so debug=0 would cost file:line
+      # backtraces; line-tables-only keeps those and drops the bloat.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -2110,6 +2117,7 @@ jobs:
           clean: false
 
       - name: "Set up toolchains"
+        id: toolchains
         uses: ./.github/actions/setup-ci-shell
         with:
           mise-install-args: "sccache direnv python uv cargo:cargo-insta cargo:cargo-nextest"
@@ -2132,12 +2140,66 @@ jobs:
           direnv allow .envrc
           direnv export gha >> "$GITHUB_ENV"
 
+      # Same probe as the msrv, wasm, gnu, musl and sdk lanes, same shape on
+      # purpose (two probes reading differently is how one of them rots);
+      # the full why-a-probe-not-a-switch reasoning lives above the msrv
+      # probe. The root is the snapshot EXPORT: this lane's three packages,
+      # selection-verbatim, so a hit substitutes the compile work and the
+      # job only runs the tests. On the Blacksmith fallback there is no nix
+      # and the probe is skipped - cargo arm unconditionally.
+      - name: "Probe the L2 unit cache"
+        id: l2
+        if: steps.toolchains.outputs.nix == 'true'
+        env:
+          # The eval runs the render IFD, so it is not free; bound it rather
+          # than let a cold guest sit here. The network probe is the cheap
+          # half and gets a tight budget of its own.
+          L2_EVAL_TIMEOUT_SECONDS: "180"
+          L2_PROBE_TIMEOUT_SECONDS: "10"
+        run: |
+          set -uo pipefail
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+
+          # Timeout (rc 124) is a slow cold guest and expected; any other
+          # nonzero exit is a broken flake and must not hide behind a green
+          # cargo arm. Keep stderr: on the error arm it is the only place
+          # the nix diagnostic survives.
+          eval_log="$(mktemp)"
+          out_path="$(timeout "${L2_EVAL_TIMEOUT_SECONDS}" nix eval --raw .#snapshot-test-export.outPath 2>"${eval_log}")" \
+            && eval_rc=0 || eval_rc=$?
+          if [ "${eval_rc}" -ne 0 ]; then
+            if [ "${eval_rc}" -eq 124 ]; then
+              echo "::notice title=L2::evaluation did not finish within ${L2_EVAL_TIMEOUT_SECONDS}s; taking the cargo arm"
+            else
+              echo "::warning title=L2::evaluation FAILED with exit ${eval_rc} (not a timeout); taking the cargo arm"
+              sed -n '1,25p' "${eval_log}"
+            fi
+            exit 0
+          fi
+
+          # Local first: runners are persistent, so a VM that already built
+          # this exact root has it on disk.
+          if nix path-info "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::already in the local store: ${out_path}; taking the nix arm"
+          # --narinfo-cache-negative-ttl 0: a probe that runs before the
+          # builder publishes must not poison this runner for an hour.
+          elif timeout "${L2_PROBE_TIMEOUT_SECONDS}" nix path-info --narinfo-cache-negative-ttl 0 --store https://cache.ix.dev "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::cache hit for ${out_path}; taking the nix arm"
+          else
+            echo "::notice title=L2::cache miss for ${out_path}; taking the cargo arm"
+          fi
+
       # Separate step so if fetch is slow, build is fast.
       - name: "Fetch cargo dependencies"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo fetch
         working-directory: baml_language
 
       - name: "Build tests with --timings"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo test --no-run -p baml_tests -p baml_cli -p baml_lsp2_actions --all-features --timings
         working-directory: baml_language
 
@@ -2147,8 +2209,80 @@ jobs:
       # list here. The musl job separately runs `baml_cli`, including
       # `pack_e2e`, so both Linux libc variants exercise the ELF pack path.
       - name: "Run snapshot tests"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo insta test --test-runner nextest -p baml_tests -p baml_cli -p baml_lsp2_actions --all-features --unreferenced=reject
         working-directory: baml_language
+
+      # The nix arm. cargo-insta still owns the run - the snapshot review
+      # semantics (the references file behind --unreferenced=reject, the
+      # .snap.new handling) live in it, not in nextest - and
+      # INSTA_CARGO_NEXTEST_BIN is its sanctioned hook for the nextest
+      # invocation. The shim inserts the export's manifests BEFORE any `--`
+      # (after it, args belong to the test binaries). The cargo arm's
+      # --all-features is compile selection and drops here (the export pins
+      # the discovered set), but the -p flags STAY: cargo-insta also uses
+      # them to scope its unreferenced-snapshot scan, and without them the
+      # scan sweeps the whole workspace and rejects other lanes' snapshots
+      # (proven live, run 32123167309: 3259/3259 tests passed, then
+      # "aborting because of unreferenced snapshots" naming baml_surface's,
+      # a package this lane does not run).
+      # nextest-snapshot-l2.toml: the lane cannot use the main config (its
+      # sdk_test_* predicates are absent from this export's metadata) nor
+      # nextest-l2.toml (this lane needs the pack-host setup scripts, which
+      # the gnu arm's metadata could not parse); see that file's header.
+      # The BAML_*_DIR overrides point the relocated binaries' corpus reads
+      # and file snapshots at the real checkout; each is inert unset and
+      # exists for exactly this arm.
+      - name: "Run snapshot tests (nix unit graph)"
+        if: steps.l2.outputs.hit == 'true'
+        run: |
+          set -euo pipefail
+          echo "::notice title=L2::arm=nix"
+          # Same retry as the sdk materialize (this lane's 19.63 GiB
+          # closure is where the cache.ix.dev HTTP/2 framing flake was
+          # seen twice, runs 32093934248 / 32096179051; --option http2
+          # false is restricted for the untrusted slot user and ignored).
+          materialize() { nix build --no-link --print-out-paths --print-build-logs "$1"; }
+          export_dir="$(materialize .#snapshot-test-export || { echo "::warning title=L2::substitution failed once; retrying"; sleep 10; materialize .#snapshot-test-export; })"
+
+          cd baml_language
+
+          shim="${RUNNER_TEMP}/cargo-nextest-prebuilt"
+          cat > "$shim" <<SHIM
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # cargo-insta forwards its cargo selection flags (-p) to the runner,
+          # and nextest refuses ANY cargo selection flag together with
+          # --binaries-metadata (proven live, run 32162724765 - the arm's
+          # first-ever cache hit). Dropping them is selection-identical: the
+          # export's binaries-metadata carries exactly the three snapshot
+          # packages and nothing else, so "everything in the export" IS the
+          # -p set. Everything after -- (insta's test filters) is kept.
+          pre=(); post=(); seen=false; skip=false
+          for a in "\$@"; do
+            if [ "\$skip" = true ]; then skip=false; continue; fi
+            if [ "\$a" = "--" ] || [ "\$seen" = true ]; then seen=true; post+=("\$a"); continue; fi
+            case "\$a" in
+              -p|--package) skip=true ;;
+              --package=*|--all-features|--workspace|--all-targets) ;;
+              *) pre+=("\$a") ;;
+            esac
+          done
+          exec cargo nextest "\${pre[@]}" \
+            --config-file "$PWD/.config/nextest-snapshot-l2.toml" \
+            --binaries-metadata "$export_dir/binaries-metadata.json" \
+            --cargo-metadata "$export_dir/cargo-metadata.json" \
+            --workspace-remap "$PWD" \
+            "\${post[@]+"\${post[@]}"}"
+          SHIM
+          chmod +x "$shim"
+
+          INSTA_CARGO_NEXTEST_BIN="$shim" \
+          INSTA_WORKSPACE_ROOT="$PWD" \
+          BAML_TESTS_DIR="$PWD/crates/baml_tests" \
+          BAML_CLI_SNAPSHOT_DIR="$PWD/crates/baml_cli/src/snapshots" \
+          BAML_LSP2_SNAPSHOT_DIR="$PWD/crates/baml_lsp2_actions/src/snapshots" \
+          cargo insta test --test-runner nextest -p baml_tests -p baml_cli -p baml_lsp2_actions --unreferenced=reject
 
       - name: "Check for snapshot changes"
         run: |
@@ -2188,7 +2322,9 @@ jobs:
           if-no-files-found: ignore
 
       - name: "Rename cargo timings"
-        if: always()
+        # The nix arm never compiles, so --timings never runs; same gate as
+        # the gnu/musl/msrv lanes.
+        if: always() && steps.l2.outputs.hit != 'true'
         run: mv target/cargo-timings/cargo-timing.html target/cargo-timings/cargo-timing-snapshot.html
         working-directory: baml_language
       - name: "Upload cargo timings"

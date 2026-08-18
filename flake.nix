@@ -911,6 +911,69 @@
           packageBuildEnv = graphPackageBuildEnv;
         };
 
+        # ------------------------------------------------------------------
+        # L2, the snapshot-tests lane
+        # ------------------------------------------------------------------
+        #
+        # The lane's exact selection: the three packages the snapshot job
+        # builds (`cargo test --no-run -p baml_tests -p baml_cli -p
+        # baml_lsp2_actions --all-features`), in ONE invocation on both arms,
+        # so feature unification is identical by construction - the
+        # gnu/musl selection-verbatim rule, unlike the sdk union graph
+        # (which states its delta).
+        #
+        # These packages were excluded from the gnu graph because their
+        # file snapshots resolved baked sandbox paths; the manifest_dir()/
+        # file_snapshot! env overrides (this PR) are what make prebuilt
+        # binaries of these crates runnable at all.
+        snapshotWorkspace = cargoUnit.buildWorkspace {
+          src = ./baml_language;
+          workspaceRoot = ./baml_language;
+          rustToolchain = gnuToolchain;
+
+          # Same reason as the msrv graph: cache.ix.dev 404s /realisations,
+          # so a floating-CA output is unsubstitutable through the only cache
+          # the pool guests can read.
+          contentAddressed = false;
+          policy = l2Policy;
+
+          # Host triple; dev + test for the same debug_assertions reason as
+          # the msrv graph.
+          profile = "dev";
+
+          cargoTargets = [
+            [
+              "--tests"
+              "--all-features"
+              "-p"
+              "baml_tests"
+              "-p"
+              "baml_cli"
+              "-p"
+              "baml_lsp2_actions"
+            ]
+          ];
+          cargoTargetNames = [ "snapshot" ];
+
+          env = {
+            # Same two reasons as the msrv graph: cargo-unit does not read
+            # cargo config's [env] table, and the workflow pins opt-level 1
+            # on both profiles workflow-wide.
+            RUST_MIN_STACK = "67108864";
+            CARGO_PROFILE_DEV_OPT_LEVEL = "1";
+            CARGO_PROFILE_TEST_OPT_LEVEL = "1";
+            # line-tables-only, mirrored in the snapshot job env (arm
+            # equivalence). These binaries RUN; the musl graph's rule.
+            # Closure unmeasured until a fleet-node nix path-info -Sh; see
+            # the measure-first warning in nix/l2-roots.txt.
+            CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
+            CARGO_PROFILE_TEST_DEBUG = "line-tables-only";
+          };
+
+          nativeBuildInputs = graphNativeBuildInputs;
+          packageBuildEnv = graphPackageBuildEnv;
+        };
+
         # Common source filtering for crane
         src = pkgs.lib.cleanSourceWith {
           src = ./engine;
@@ -1291,6 +1354,34 @@
                   sdkWorkspace.unitsNix
                   sdkWorkspace.unitGraphJson
                   sdkWorkspace.vendorDir
+                ];
+              }
+              ''
+                set -euo pipefail
+                mkdir -p "$out"
+                printf '%s\n' "''${roots[@]}" > "$out/eval-roots"
+              '';
+
+        # The snapshot lane's root: same whole-selection nextest export
+        # shape as musl, gnu and sdk (see the musl note above).
+        packages.snapshot-test-export =
+          if pkgs.stdenv.isDarwin then
+            throw "packages.snapshot-test-export builds the Linux CI lane's unit graph; there is no Darwin lane to mirror"
+          else
+            snapshotWorkspace.nextestExport;
+
+        packages.snapshot-eval-roots =
+          if pkgs.stdenv.isDarwin then
+            throw "packages.snapshot-eval-roots belongs to the Linux snapshot graph"
+          else
+            idxPkgs.runCommand "baml-snapshot-eval-roots"
+              {
+                __structuredAttrs = true;
+                strictDeps = true;
+                roots = [
+                  snapshotWorkspace.unitsNix
+                  snapshotWorkspace.unitGraphJson
+                  snapshotWorkspace.vendorDir
                 ];
               }
               ''

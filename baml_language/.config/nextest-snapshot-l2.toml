@@ -1,0 +1,33 @@
+# Config for the SNAPSHOT lane's nix-unit-graph run ONLY (the shim in the
+# "Run snapshot tests (nix unit graph)" step passes this via --config-file).
+#
+# Why a third config exists (see nextest-l2.toml for the parse rule): each
+# L2 export's trimmed cargo metadata carries only its own packages, and a
+# config predicate naming an absent package is a HARD parse error. The
+# snapshot export carries baml_tests + baml_cli + baml_lsp2_actions, so it
+# cannot use the main config (sdk_test_* predicates error) NOR share
+# nextest-l2.toml once that lane needs baml_cli's pack-host setup scripts
+# (the gnu export lacks baml_cli, so a package(=baml_cli) entry there would
+# break the gnu arm's parse). This file = the version pin + exactly the
+# scripts the snapshot lane's selection fires. Keep the script entries
+# byte-identical to the main config's pack-host pair; if the exports ever
+# grow whole-workspace metadata, delete this file with the others.
+nextest-version = "0.9.98"
+
+experimental = ["setup-scripts"]
+
+[scripts.setup.baml_pack_host_unix]
+command = './crates/baml_cli/tests/build-pack-host.sh'
+
+[scripts.setup.baml_pack_host_win]
+command = ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './crates/baml_cli/tests/build-pack-host.ps1']
+
+[[profile.default.scripts]]
+filter = 'package(=baml_cli) and kind(=test)'
+platform = { host = 'cfg(unix)' }
+setup = 'baml_pack_host_unix'
+
+[[profile.default.scripts]]
+filter = 'package(=baml_cli) and kind(=test)'
+platform = { host = 'cfg(windows)' }
+setup = 'baml_pack_host_win'

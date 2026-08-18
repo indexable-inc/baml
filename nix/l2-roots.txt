@@ -82,3 +82,12 @@ gnu-eval-roots
 # exactly the shape the 30 GiB refusal exists for.
 sdk-test-export
 sdk-eval-roots
+
+# The snapshot lane's three packages, selection-verbatim (one invocation
+# on both arms - identical feature unification by construction).
+# Debuginfo is line-tables-only on both arms. Same rule as every export:
+# MEASURE `nix path-info -Sh .#snapshot-test-export` on a fleet node
+# before the builder's first tick on this root - baml_tests carries the
+# workspace's heaviest test binaries.
+snapshot-test-export
+snapshot-eval-roots
