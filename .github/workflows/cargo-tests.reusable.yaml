@@ -274,6 +274,7 @@ jobs:
           BAML_PARAM_SCHEMA_GOLDEN="$PWD/../typescript2/pkg-playground/src/__fixtures__/param-schema-golden.json" \
           BAML_SURFACE_SNAPSHOT_DIR="$PWD/crates/baml_surface/src/snapshots" \
           BAML_BRIDGE_CFFI_DIR="$PWD/crates/bridge_cffi" \
+          BAML_WORKSPACE_ROOT="$PWD" \
           cargo nextest run \
             --config-file "$PWD/.config/nextest-l2.toml" \
             --binaries-metadata "$export_dir/binaries-metadata.json" \
@@ -509,6 +510,7 @@ jobs:
           BAML_PARAM_SCHEMA_GOLDEN="$PWD/../typescript2/pkg-playground/src/__fixtures__/param-schema-golden.json" \
           BAML_SURFACE_SNAPSHOT_DIR="$PWD/crates/baml_surface/src/snapshots" \
           BAML_BRIDGE_CFFI_DIR="$PWD/crates/bridge_cffi" \
+          BAML_WORKSPACE_ROOT="$PWD" \
           cargo nextest run \
             --config-file "$PWD/.config/nextest-l2.toml" \
             --binaries-metadata "$export_dir/binaries-metadata.json" \
