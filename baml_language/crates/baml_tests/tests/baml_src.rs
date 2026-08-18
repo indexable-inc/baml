@@ -10,10 +10,12 @@ use std::{
 use bex_vm::debug::{BytecodeFormat, display_program};
 use bex_vm_types::{Function, FunctionOrigin, Object, Program};
 
-const SNAPSHOT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/snapshots/baml_src");
+fn snapshot_path() -> PathBuf {
+    baml_tests::manifest_dir().join("snapshots/baml_src")
+}
 
 fn baml_src_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("baml_src")
+    baml_tests::manifest_dir().join("baml_src")
 }
 
 /// Read every `*.baml` file under `baml_src/`, returning `(relative_path, content)`
@@ -80,7 +82,7 @@ fn promptfiddle_demo_compiles() {
     let path = std::env::var_os("BAML_PROMPTFIDDLE_DEFAULT_BAML")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
+            baml_tests::manifest_dir()
                 .join("../../../typescript2/app-promptfiddle/src/playground/default.baml")
         });
     let source = std::fs::read_to_string(&path).unwrap_or_else(|error| {
@@ -179,7 +181,7 @@ fn bytecode() {
         funcs.sort_by(|(a, _), (b, _)| a.cmp(b));
         let output = display_program(&funcs, BytecodeFormat::Textual);
         insta::with_settings!({
-            snapshot_path => SNAPSHOT_PATH,
+            snapshot_path => snapshot_path(),
             omit_expression => true,
             prepend_module_to_snapshot => false,
         }, {
@@ -200,15 +202,8 @@ fn baml_test() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("config.toml"), "[update]\nauto_check = false\n").unwrap();
     let status = std::process::Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "baml_cli",
-            "--",
-            "test",
-            "--from",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/baml_src"),
-        ])
+        .args(["run", "-p", "baml_cli", "--", "test", "--from"])
+        .arg(baml_src_dir())
         .env("BAML_CLI_ALLOW_DIRECT", "1")
         .env("BAML_HOME", &home)
         .env("BAML_CACHE_DIR", tmp.path().join("cache"))
