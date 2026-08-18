@@ -1231,6 +1231,12 @@ jobs:
       # but GOFLAGS cannot carry a flag value containing a space; -w alone is
       # most of the link-time win.)
       GOFLAGS: "-ldflags=-w"
+      # Mirrored in the sdk unit graph (flake.nix sdkWorkspace) so both arms
+      # of the L2 lane compile the same program shape - the gnu/musl rule.
+      # These binaries RUN, so debug=0 would cost file:line backtraces;
+      # line-tables-only keeps those and drops the variable/type bloat.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1249,6 +1255,7 @@ jobs:
       # the arm below is byte-identical to the two steps it replaces:
       # `rustup show` + setup-mise with this lane's install-args.
       - name: "Set up CI toolchains"
+        id: toolchains
         uses: ./.github/actions/setup-ci-shell
         with:
           shell: ci-sdk
@@ -1334,8 +1341,74 @@ jobs:
           direnv allow .envrc
           direnv export gha >> "$GITHUB_ENV"
 
+      # Same probe as the msrv, wasm, gnu and musl lanes, same shape on
+      # purpose (two probes reading differently is how one of them rots);
+      # the full why-a-probe-not-a-switch reasoning lives above the msrv
+      # probe. The root is the sdk union EXPORT: one graph serving the whole
+      # matrix (flake.nix sdkWorkspace says why), so a hit substitutes this
+      # lane's compile work and the job only runs setup + tests. Gated on
+      # the nix arm: the macOS lanes and the Blacksmith fork-PR fallback
+      # have no nix and take the cargo arm unconditionally.
+      # Lane allowlist, currently EMPTY and deliberately so: every sdk
+      # lane's build.rs generates its fixture trees into the source tree
+      # as a compile side effect, and a substituted test binary cannot
+      # reproduce that - the lanes only pass on members holding another
+      # arm's leftover trees (proven across runs 32093934248, 32096136093
+      # and 32106655757: the same lanes flip green on warm members and red
+      # on freshly rebuilt ones; go/typescript setup scripts consume
+      # generated/ dirs, they do not create them). When the unit graph
+      # learns to retain and restore build-script side-effect trees
+      # (index-side, filed), enabling a lane = putting its sdk-label in
+      # this list; nix-arm suite runs measured green at 56-113s vs
+      # 96-150s Blacksmith medians on warm members, so the prize is real.
+      - name: "Probe the L2 unit cache"
+        id: l2
+        if: matrix.os-label == 'linux' && steps.toolchains.outputs.nix == 'true' && contains(',,', format(',{0},', matrix.sdk-label))
+        env:
+          # The eval runs the render IFD, so it is not free; bound it rather
+          # than let a cold guest sit here. The network probe is the cheap
+          # half and gets a tight budget of its own.
+          L2_EVAL_TIMEOUT_SECONDS: "180"
+          L2_PROBE_TIMEOUT_SECONDS: "10"
+        run: |
+          set -uo pipefail
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+
+          # Timeout (rc 124) is a slow cold guest and expected; any other
+          # nonzero exit is a broken flake and must not hide behind a green
+          # cargo arm. Keep stderr: on the error arm it is the only place
+          # the nix diagnostic survives.
+          eval_log="$(mktemp)"
+          out_path="$(timeout "${L2_EVAL_TIMEOUT_SECONDS}" nix eval --raw .#sdk-test-export.outPath 2>"${eval_log}")" \
+            && eval_rc=0 || eval_rc=$?
+          if [ "${eval_rc}" -ne 0 ]; then
+            if [ "${eval_rc}" -eq 124 ]; then
+              echo "::notice title=L2::evaluation did not finish within ${L2_EVAL_TIMEOUT_SECONDS}s; taking the cargo arm"
+            else
+              echo "::warning title=L2::evaluation FAILED with exit ${eval_rc} (not a timeout); taking the cargo arm"
+              sed -n '1,25p' "${eval_log}"
+            fi
+            exit 0
+          fi
+
+          # Local first: runners are persistent, so a VM that already built
+          # this exact root has it on disk.
+          if nix path-info "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::already in the local store: ${out_path}; taking the nix arm"
+          # --narinfo-cache-negative-ttl 0: a probe that runs before the
+          # builder publishes must not poison this runner for an hour.
+          elif timeout "${L2_PROBE_TIMEOUT_SECONDS}" nix path-info --narinfo-cache-negative-ttl 0 --store https://cache.ix.dev "${out_path}" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=L2::cache hit for ${out_path}; taking the nix arm"
+          else
+            echo "::notice title=L2::cache miss for ${out_path}; taking the cargo arm"
+          fi
+
       # Separate step so if fetch is slow, build is fast.
       - name: "Fetch cargo dependencies"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo fetch
         working-directory: baml_language
 
@@ -1361,8 +1434,38 @@ jobs:
         working-directory: baml_language
 
       - name: "Build tests with --timings"
+        if: steps.l2.outputs.hit != 'true'
         run: cargo test --no-run -p ${{ matrix.package-name }} --all-features --timings
         working-directory: baml_language
+
+      # The nix arm's whole compile step: substituting the export pulls the
+      # two nextest manifests and every interpolated test binary in one
+      # move. Resolved once into the env; the run steps below hand nextest
+      # the manifests instead of compiling. `-p`/`--all-features` from the
+      # cargo arm are compile-selection flags and have no meaning against
+      # prebuilt manifests; the -E filters are carried verbatim.
+      - name: "Materialize the L2 unit graph"
+        if: steps.l2.outputs.hit == 'true'
+        run: |
+          set -euo pipefail
+          echo "::notice title=L2::arm=nix"
+          # One retry: cache.ix.dev intermittently kills large NAR
+          # downloads with "HTTP error 200 (Stream error in the HTTP/2
+          # framing layer)" (runs 32093934248 / 32096179051), and a retry
+          # resumes from the paths that already landed. (--option http2
+          # false would sidestep the framing bug but is a restricted nix
+          # setting the untrusted slot user cannot set - proven ignored,
+          # run 32099755589.) Platform fix tracked fleet-side.
+          materialize() { nix build --no-link --print-out-paths --print-build-logs "$1"; }
+          export_dir="$(materialize .#sdk-test-export || { echo "::warning title=L2::substitution failed once; retrying"; sleep 10; materialize .#sdk-test-export; })"
+          echo "L2_EXPORT_DIR=${export_dir}" >> "$GITHUB_ENV"
+          # BAML_SDK_TEST_GO_DIR: sdk_test_go resolves its generated-Go
+          # sweep from its baked unit source dir, which does not exist in
+          # the relocated build; the test ships this override for exactly
+          # that case (inert for every other lane). INSTA_WORKSPACE_ROOT:
+          # cheap insurance for inline snapshots, same as the gnu arm.
+          echo "BAML_SDK_TEST_GO_DIR=${GITHUB_WORKSPACE}/baml_language/sdk_tests/crates/go" >> "$GITHUB_ENV"
+          echo "INSTA_WORKSPACE_ROOT=${GITHUB_WORKSPACE}/baml_language" >> "$GITHUB_ENV"
 
       - name: "Show sccache stats"
         if: always()
@@ -1371,18 +1474,48 @@ jobs:
       - name: "Run sdk test setup"
         # The C# crate uses nextest's setup-script hook directly and has no
         # generated setup_guard test. Its setup still runs before the full suite.
-        if: matrix.sdk-label != 'csharp'
+        if: matrix.sdk-label != 'csharp' && steps.l2.outputs.hit != 'true'
         run: cargo nextest run -p ${{ matrix.package-name }} --all-features -E 'package(=${{ matrix.package-name }}) and test(setup_guard::ran)'
         working-directory: baml_language
 
+      - name: "Run sdk test setup (nix unit graph)"
+        if: matrix.sdk-label != 'csharp' && steps.l2.outputs.hit == 'true'
+        run: |
+          cargo nextest run \
+            --binaries-metadata "$L2_EXPORT_DIR/binaries-metadata.json" \
+            --cargo-metadata "$L2_EXPORT_DIR/cargo-metadata.json" \
+            --workspace-remap "$PWD" \
+            -E 'package(=${{ matrix.package-name }}) and test(setup_guard::ran)'
+        working-directory: baml_language
+
       - name: "Run sdk tests"
-        if: matrix.sdk-label != 'csharp'
+        if: matrix.sdk-label != 'csharp' && steps.l2.outputs.hit != 'true'
         run: cargo nextest run -p ${{ matrix.package-name }} --all-features -E 'package(=${{ matrix.package-name }})'
         working-directory: baml_language
 
+      - name: "Run sdk tests (nix unit graph)"
+        if: matrix.sdk-label != 'csharp' && steps.l2.outputs.hit == 'true'
+        run: |
+          cargo nextest run \
+            --binaries-metadata "$L2_EXPORT_DIR/binaries-metadata.json" \
+            --cargo-metadata "$L2_EXPORT_DIR/cargo-metadata.json" \
+            --workspace-remap "$PWD" \
+            -E 'package(=${{ matrix.package-name }})'
+        working-directory: baml_language
+
       - name: "Run C# sdk tests"
-        if: matrix.sdk-label == 'csharp'
+        if: matrix.sdk-label == 'csharp' && steps.l2.outputs.hit != 'true'
         run: cargo nextest run -p ${{ matrix.package-name }} --all-features --no-fail-fast -E 'package(=${{ matrix.package-name }})'
+        working-directory: baml_language
+
+      - name: "Run C# sdk tests (nix unit graph)"
+        if: matrix.sdk-label == 'csharp' && steps.l2.outputs.hit == 'true'
+        run: |
+          cargo nextest run --no-fail-fast \
+            --binaries-metadata "$L2_EXPORT_DIR/binaries-metadata.json" \
+            --cargo-metadata "$L2_EXPORT_DIR/cargo-metadata.json" \
+            --workspace-remap "$PWD" \
+            -E 'package(=${{ matrix.package-name }})'
         working-directory: baml_language
 
       # The Rust bridge runtime crate (baml_bridge). Its tests load the engine
@@ -1393,8 +1526,18 @@ jobs:
       # (where the non-cacheable cdylib build ran as a silent nextest setup
       # script and stalled the Windows job).
       - name: "Run rust bridge tests"
-        if: matrix.sdk-label == 'rust'
+        if: matrix.sdk-label == 'rust' && steps.l2.outputs.hit != 'true'
         run: cargo nextest run -p baml_bridge --all-features
+        working-directory: baml_language
+
+      - name: "Run rust bridge tests (nix unit graph)"
+        if: matrix.sdk-label == 'rust' && steps.l2.outputs.hit == 'true'
+        run: |
+          cargo nextest run \
+            --binaries-metadata "$L2_EXPORT_DIR/binaries-metadata.json" \
+            --cargo-metadata "$L2_EXPORT_DIR/cargo-metadata.json" \
+            --workspace-remap "$PWD" \
+            -E 'package(=baml_bridge)'
         working-directory: baml_language
 
       - name: "Upload test results on failure"
@@ -1424,7 +1567,9 @@ jobs:
           if-no-files-found: ignore
 
       - name: "Rename cargo timings"
-        if: always()
+        # The nix arm never compiles, so --timings never runs; same gate as
+        # the gnu/musl/msrv lanes.
+        if: always() && steps.l2.outputs.hit != 'true'
         run: mv target/cargo-timings/cargo-timing.html target/cargo-timings/cargo-timing-sdk-tests-${{ matrix.sdk-label }}-${{ matrix.os-label }}.html
         working-directory: baml_language
       - name: "Upload cargo timings"

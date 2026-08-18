@@ -73,3 +73,12 @@ musl-eval-roots
 # builder's first tick on this root.
 gnu-test-export
 gnu-eval-roots
+
+# One union export for the whole sdk-tests matrix (all sdk_test_* crates +
+# baml_bridge; flake.nix sdkWorkspace says why union, not per-lane).
+# Debuginfo is line-tables-only on both arms. Same rule as musl and gnu:
+# MEASURE `nix path-info -Sh .#sdk-test-export` on a fleet node before the
+# builder's first tick on this root - ten test-binary-heavy packages is
+# exactly the shape the 30 GiB refusal exists for.
+sdk-test-export
+sdk-eval-roots
