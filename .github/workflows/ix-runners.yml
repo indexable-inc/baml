@@ -52,12 +52,8 @@ on:
     # rather than an outage.
     workflows:
       - "CI - BAML Language"
+      - "CI on ix (preview)"
       - "ix cross builds"
-      - "Test Rust SDK Cross-Platform"
-      - "Test Go Client Windows Support"
-      - "TypeScript2"
-      - "Canary cache refresh"
-      - "BAML Release"
     types: [requested]
   push:
     # Default branch only: a feature-branch push must not be able to roll the
