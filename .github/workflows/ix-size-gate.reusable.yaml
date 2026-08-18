@@ -446,9 +446,12 @@ jobs:
     runs-on: ${{ (((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "ix-light"]')) || 'blacksmith-4vcpu-ubuntu-2404' }}
     if: ${{ always() && !cancelled() }}
     needs: [size-gate-linux, size-gate-macos, size-gate-windows, size-gate-wasm]
+    # Preview divergence from the source file: no pull-requests: write. The
+    # report's PR-comment step is best-effort by design (it already fails
+    # soft on fork PRs); dropping the permission keeps the gating workflow's
+    # comment the only one, and the report stays in the job summary.
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
