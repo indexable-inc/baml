@@ -61,7 +61,7 @@ jobs:
 
       - name: Reconcile
         if: steps.optin.outputs.ok == 'true'
-        uses: indexable-inc/ix-runners@1da294a29ca9dcc20eec21f3f5c9856dc10645eb
+        uses: indexable-inc/ix-runners@6b2a91c8ddcb45010a8d8a0fc9740e1bb63b8d4a
         with:
           ix-token: ${{ secrets.IX_TOKEN }}
           token-source: ix
